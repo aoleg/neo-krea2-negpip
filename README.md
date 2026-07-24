@@ -144,12 +144,6 @@ does not index it.
   the sign of the system instruction is not what `(word:-1.0)` asks for. The mask is confined
   to the fragment itself.
 
-The port was verified offline against Forge Neo's real `tokenize_line`, `strip_template`,
-`prompt_parser` and `backend/sampling` code, with only the text encoder and the diffusion
-model faked: the conditioning it emits is byte-identical to the engine's own, the mask
-indexes the same positions after template stripping, and cond/uncond stay aligned once
-batched together.
-
 ## Credits
 
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip) — NegPiP itself.
