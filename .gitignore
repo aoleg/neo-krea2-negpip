@@ -1,1 +1,5 @@
-__pycache__
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.vscode/
+.idea/
