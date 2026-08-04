@@ -22,6 +22,14 @@ which is Forge's own behaviour minus the sign that text fusion would have eaten.
 
 Both rows are built over the exact token stream the multipliers are built over, and sliced
 at the exact same `strip_template` offset, so they cannot drift apart.
+
+There are two ways to build that stream.  Forge's own is one templated encode per weighted
+segment (`_tokenize_segmented`), which means a weight changes what the model reads before
+any lever is applied.  The other is to rejoin the segments and encode once
+(`_tokenize_single`), locating each fragment by character offset — the conditioning is
+then identical to the same prompt written with no weights at all, and the weights do
+nothing but drive the levers.  The second is opt-in, and falls back to the first whenever
+the tokenizer cannot report offsets.
 """
 
 from functools import wraps
@@ -87,19 +95,35 @@ def _segment_text_span(engine: "Qwen3VLTextProcessingEngine", segment: list) -> 
     return start, end
 
 
-def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
+def _levers(config: WeightConfig, weight: float) -> tuple[float, float, float]:
+    """One parsed weight -> `(emphasis multiplier, value factor, logit bias)`.
+
+    A segment is either the emphasis pass's or ours, never both — a claimed weight leaves
+    `1.0` behind in the multipliers, so the magnitude is applied once, at the lever that
+    can carry it.  `abs`, not the signed weight, for anything left to emphasis: a negated
+    hidden state is a different prompt, not an inverted one, which is the whole reason
+    this extension exists.
+    """
+    factor = config.value_factor(weight)
+    bias = config.logit_bias(weight)
+    claimed = factor != 1.0 or bias != 0.0
+
+    return (1.0 if claimed else abs(weight)), factor, bias
+
+
+def _tokenize_segmented(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
     """`Qwen3VLTextProcessingEngine.tokenize_line`, with the claimed weights split off.
 
-    Returns the token stream plus three rows indexed by it: the emphasis multipliers, the
-    value factors and the logit biases.  A segment is either the emphasis pass's or ours,
-    never both — a claimed weight leaves `1.0` behind in the multipliers, so the magnitude
-    is applied once, at the lever that can carry it.
+    Forge's own shape: every weighted segment is tokenised in its own copy of the whole
+    chat template, so the emphasis multiplier covers the boilerplate too.  Our rows are
+    confined to the fragment (§`_segment_text_span`), but the extra template copies are
+    still in the conditioning.  `_tokenize_single` is the way out of that; this stays as
+    the fallback, and as the behaviour for anyone who leaves the option off.
 
     Krea 2 conditioning in Forge never carries images — `Krea2.get_learned_conditioning`
     calls the engine with the text only — so the image-placeholder branch of the original
     has no counterpart here.
     """
-    parsed = weighted_segments(line, engine.emphasis.name)
     tokenized = engine.tokenize([text for text, _ in parsed])
 
     tokens: list = []
@@ -108,13 +132,8 @@ def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Wei
     biases: list[float] = []
 
     for segment, (_, weight) in zip(tokenized, parsed):
-        factor = config.value_factor(weight)
-        bias = config.logit_bias(weight)
+        multiplier, factor, bias = _levers(config, weight)
         claimed = factor != 1.0 or bias != 0.0
-
-        #   `abs`, not the signed weight: a negated hidden state is a different prompt,
-        #   not an inverted one, and that is the whole reason this extension exists
-        multiplier = 1.0 if claimed else abs(weight)
         start, end = _segment_text_span(engine, segment) if claimed else (0, 0)
 
         for i, token in enumerate(segment):
@@ -125,6 +144,100 @@ def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Wei
             biases.append(bias if inside else 0.0)
 
     return tokens, multipliers, factors, biases
+
+
+def _token_owners(offsets: list[tuple[int, int]], bounds: list[tuple[int, int]]) -> list[int | None]:
+    """Which parsed segment each token belongs to, by majority of its characters.
+
+    A token can straddle a segment boundary — `(blurry:-1.0), sharp` leaves `blurry` and
+    `,` adjacent with nothing between them, and a BPE merge across that seam is ordinary.
+    Whoever owns most of the token's text owns the token; ties go to the earlier segment,
+    so the rule is deterministic and never gives one token two weights.
+    """
+    owners: list[int | None] = []
+
+    for start, end in offsets:
+        best, overlap = None, 0
+
+        for index, (low, high) in enumerate(bounds):
+            shared = min(end, high) - max(start, low)
+            if shared > overlap:
+                best, overlap = index, shared
+
+        owners.append(best)
+
+    return owners
+
+
+def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[str, float]], config: WeightConfig):
+    """The weighted prompt as **one** templated encode, or `None` if that isn't possible.
+
+    `parse_prompt_attention` splits the prompt before the encoder ever sees it, and the
+    engine then wraps each piece in the full chat template.  Rejoining the pieces and
+    encoding once gives conditioning identical to the same prompt written without any
+    weights at all — the weights stop perturbing what the model reads and only drive the
+    attention levers, which is what they were supposed to do.
+
+    Localisation is by character offsets, which every HF *fast* tokenizer reports.  There
+    is deliberately no second heuristic behind that: if offsets are unavailable, or the
+    ids disagree with `engine.tokenize`, the caller falls back to `_tokenize_segmented`,
+    which is a real tested encoder rather than a guess at where a fragment landed.
+    """
+    clean = "".join(text for text, _ in parsed)
+    stripped = clean.strip()
+    lead = len(clean) - len(clean.lstrip())
+
+    prefix, _, _ = engine.llama_template.partition("{}")
+    tokens = engine.tokenize([clean])[0]
+
+    try:
+        encoded = engine.tokenizer([engine.llama_template.format(stripped)], return_offsets_mapping=True)
+    except (NotImplementedError, TypeError, ValueError):
+        return None
+
+    offsets = encoded.get("offset_mapping") if hasattr(encoded, "get") else None
+    if not offsets:
+        return None
+
+    try:
+        #   the token stream still comes from the engine; this only has to agree with it
+        if [int(token) for token in encoded["input_ids"][0]] != [int(token) for token in tokens]:
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    bounds: list[tuple[int, int]] = []
+    cursor = 0
+    for text, _ in parsed:
+        low = min(max(cursor - lead, 0), len(stripped))
+        cursor += len(text)
+        high = min(max(cursor - lead, 0), len(stripped))
+        bounds.append((len(prefix) + low, len(prefix) + high))
+
+    levers = [_levers(config, weight) for _, weight in parsed]
+
+    multipliers = [1.0] * len(tokens)
+    factors = [1.0] * len(tokens)
+    biases = [0.0] * len(tokens)
+
+    for i, owner in enumerate(_token_owners(list(offsets[0]), bounds)):
+        if owner is None:
+            continue
+        multipliers[i], factors[i], biases[i] = levers[owner]
+
+    return tokens, multipliers, factors, biases
+
+
+def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
+    """One prompt line -> the token stream plus the three rows indexed by it."""
+    parsed = weighted_segments(line, engine.emphasis.name)
+
+    if config.single_pass:
+        single = _tokenize_single(engine, parsed, config)
+        if single is not None:
+            return single
+
+    return _tokenize_segmented(engine, parsed, config)
 
 
 def _template_end(engine: "Qwen3VLTextProcessingEngine", tokens: list, seq_len: int) -> int:

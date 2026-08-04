@@ -60,6 +60,7 @@ first and stays out of the way, so it is safe to leave ticked.
 | Handle de-emphasis too | off | Also claim weights between `0` and `1`, scaling the value vector instead of the embedding. Off by default because ordinary prompts use `(word:0.8)` freely and Forge already has a meaning for it. |
 | Handle emphasis in attention | off | Claim weights above `1` and apply them as an attention bias rather than an embedding scale — see [Notes](#notes) for why the ordinary kind barely works here. |
 | Emphasis gain | `2.0` | How much bias a weight above `1` is worth. Attention weight is multiplied by `exp(gain × (weight − 1))` in every hooked block, so this compounds fast; lower it before raising prompt weights. |
+| Encode the prompt in one pass | off | Forge encodes a weighted prompt once *per weighted segment*, each in its own copy of the chat template. This rejoins them into a single encode, so the conditioning is identical to the same prompt written with no weights at all and the weights do nothing but drive the levers above. Changes the output of every weighted prompt — see [Notes](#notes). |
 
 ### Advanced
 
@@ -86,6 +87,17 @@ Everything is written to the infotext and pastes back from it.
   actually contains a weight above `1`.
 - **Anything not claimed behaves exactly as it does without this extension.** With both
   opt-ins off, `(word:0.8)` and `(word:1.4)` go through Forge's emphasis untouched.
+- **A weight normally changes what the model reads, before any lever applies.**
+  `parse_prompt_attention` splits the prompt before the encoder sees it, and
+  `Qwen3VLTextProcessingEngine` then wraps *each piece* in the full chat template — so
+  `a portrait (blurry:-1.0) sharp` reaches the model as three templated encodes back to
+  back, system instruction and all, where the unweighted prompt would have been one. That
+  is Forge's own behaviour for any weighted Krea 2 prompt, with or without this extension.
+  *Encode the prompt in one pass* removes it: the conditioning becomes byte-identical to
+  the unweighted prompt. Worth trying if weighted prompts have felt oddly unlike their
+  unweighted versions. It is off by default because it changes the output of every
+  weighted prompt, and needs a fast tokenizer (it reports character offsets); without one
+  it quietly falls back to the per-segment path.
 - **Emphasis must be on.** If the *Emphasis* setting is `None`, Forge never parses `(x:-1)`
   as a weight at all, so there is nothing to claim. The extension logs a warning and stands
   down.
@@ -171,7 +183,18 @@ do not index it.
   tokenises to several copies of the template with the fragments spliced between them.
   Emphasis scales all of it, which is Forge's own behaviour and is what an unclaimed weight
   still gets — but flipping the sign of the system instruction is not what `(word:-1.0)`
-  asks for. Both rows are confined to the fragment itself.
+  asks for. Both rows are confined to the fragment itself, located structurally inside each
+  templated segment rather than at an assumed offset.
+
+- **Or the extra templates never happen at all.** *Encode the prompt in one pass* rejoins
+  the parser's segments and encodes that once, locating each fragment by the character
+  offsets a fast tokenizer reports and assigning every token to whichever segment covers
+  most of its characters — so a BPE merge across a segment seam lands in exactly one of
+  them. The token stream still comes from `engine.tokenize`; the offsets only have to agree
+  with it, and are checked against it before being used. There is deliberately no second
+  localisation heuristic: when offsets are unavailable or disagree, it falls back to the
+  per-segment path above, which is a real tested encoder rather than a guess at where a
+  fragment landed.
 
 ## Credits
 

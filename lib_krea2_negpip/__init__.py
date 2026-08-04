@@ -78,6 +78,8 @@ class WeightConfig:
     emphasis: bool = False
     """claim `w > 1` and route it through `logit_bias` instead of Forge's emphasis"""
     gain: float = 2.0
+    single_pass: bool = False
+    """encode the prompt once instead of once per weighted segment; see `text.py`"""
 
     @property
     def uses_value(self) -> bool:
