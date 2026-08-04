@@ -1,21 +1,29 @@
 # Neo Krea 2 NegPiP
 
-A **Forge Neo** extension that brings **NegPiP** — negative prompt in prompt — to **Krea 2**.
+A **Forge Neo** extension that lets you put negative prompting *inside* your prompt, for
+**Krea 2**.
 
-Give a word a negative weight and it gets *subtracted* instead of emphasised:
+Give a word a negative weight and the model subtracts it instead of emphasising it:
+
+```text
+a portrait photo, cinematic lighting, (blurry:-1.0), (plastic skin:-1.0)
+```
+
+The negative prompt field pushes the whole image away from a concept after the fact. A
+negative weight works in the opposite direction — the word is cancelled *where the model
+reads it*, in place, without touching anything else you asked for. In practice that means
+you can suppress something specific — a texture, a lighting style, a look you keep getting
+by accident — without the rest of the image drifting the way a heavy negative prompt makes
+it drift.
+
+It works in either field:
 
 - `(blurry:-1.0)` in the **positive** prompt removes the concept
-- `(aqua hair:-1.0)` in the **negative** prompt enforces it instead
-- `(blurry:0)` removes the word's contribution outright, without inverting it
-
-This is the thing a negative prompt cannot do on its own. A negative prompt only pushes the
-prediction away at CFG time; NegPiP negates the token's *value* vector inside attention, so
-the concept is cancelled where it is read rather than argued with afterwards.
+- `(aqua hair:-1.0)` in the **negative** prompt *enforces* it instead — a double negative
 
 > [!NOTE]
 > **Krea 2 only.** For SD1, SDXL and Anima use
-> [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) — none of its three paths
-> apply to Krea 2, see [How it works](#how-it-works). The two extensions can be installed
+> [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed
 > side by side; each stands down for models it does not handle.
 
 ## Install
@@ -34,167 +42,141 @@ git clone https://github.com/aoleg/neo-krea2-negpip
 
 No extra dependencies.
 
-## Usage
+## Quick start
 
-Load a Krea 2 checkpoint, open the **NegPiP (Krea 2)** accordion, tick it on, and write
-negative weights into either prompt field:
+1. Load a Krea 2 checkpoint.
+2. Open the **NegPiP (Krea 2)** panel and tick it on.
+3. Put a negative weight in either prompt field and generate.
 
-```text
-a portrait photo, cinematic lighting, (blurry:-1.0), (low quality:-1.2)
-```
-
-The console prints how many tokens were flagged:
+The console confirms it took effect, with the number of words affected:
 
 ```text
 NegPiP Enable (Positive: 3)
 ```
 
-Nothing happens without a negative weight somewhere in the prompt — the extension checks
-first and stays out of the way, so it is safe to leave ticked.
+Nothing happens unless a prompt actually contains a negative weight, so it is safe to leave
+switched on all the time.
 
-## Controls
+## What the numbers mean
 
-| Control | Default | Description |
-| --- | --- | --- |
-| Value strength | `1.0` | How far a negative weight is taken. At `1.0` the value factor *is* the weight, so `(word:-1.0)` is a plain sign flip — the classic NegPiP — and `(word:0)` is a clean removal. Above `1.0` overshoots, below softens, `0.0` is off. |
-| Handle de-emphasis too | off | Also claim weights between `0` and `1`, scaling the value vector instead of the embedding. Off by default because ordinary prompts use `(word:0.8)` freely and Forge already has a meaning for it. |
-| Handle emphasis in attention | off | Claim weights above `1` and apply them as an attention bias rather than an embedding scale — see [Notes](#notes) for why the ordinary kind barely works here. |
-| Emphasis gain | `2.0` | How much bias a weight above `1` is worth. Attention weight is multiplied by `exp(gain × (weight − 1))` in every hooked block, so this compounds fast; lower it before raising prompt weights. |
-| Encode the prompt in one pass | off | Forge encodes a weighted prompt once *per weighted segment*, each in its own copy of the chat template. This rejoins them into a single encode, so the conditioning is identical to the same prompt written with no weights at all and the weights do nothing but drive the levers above. Changes the output of every weighted prompt — see [Notes](#notes). |
+With the default settings, the weight you type is the strength of the subtraction:
+
+| Weight | What happens to that word |
+| --- | --- |
+| `(word:-2.0)` | Subtracted hard. Use when `-1.0` was not enough; can start pulling the image around it. |
+| `(word:-1.0)` | The classic setting. The word's contribution is inverted — the model actively steers away from it. |
+| `(word:-0.5)` | A gentle push away. Good when `-1.0` overcorrects into something else. |
+| `(word:0)` † | The word is simply deleted from the image, without pushing away from it. Useful for a word the sentence needs in order to read naturally, but which you do not want rendered. |
+| `(word:1.0)` | Normal. No effect. |
+
+† Weights from `0` up to `1` — including `(word:0)` itself — are only handled once
+**Handle de-emphasis too** is switched on. Left off, they fall through to Forge's ordinary
+de-emphasis, and a prompt containing nothing but those will not engage the extension at all.
+
+Start at `-1.0`. If the thing is still there, go further negative; if the image starts
+looking distorted or fixated on the opposite, come back up.
+
+Multi-word phrases work: `(plastic looking skin:-1.0)` affects all three words.
+
+## Settings
+
+### Value strength
+
+**What it does:** scales every negative weight in the prompt at once. At `1.0` the weight
+you typed is used as-is, which is what the table above describes.
+
+**What you'll see:** turning it up makes every negative weight bite harder without editing
+the prompt — the quickest way to test whether a prompt needs more suppression. Turning it
+down softens all of them together. At `0.0` negative weights do nothing.
+
+Prefer editing individual weights once you know which word needs it; this is the global
+dial for when *everything* is too weak or too strong.
+
+### Handle de-emphasis too
+
+**What it does:** takes over ordinary de-emphasis — weights between `0` and `1`, like
+`(word:0.7)` — instead of leaving it to Forge's normal handling.
+
+**What you'll see:** de-emphasis becomes considerably more effective. Forge's normal
+approach scales the text embedding, and Krea 2's text encoder largely normalises that back
+out, so `(word:0.7)` often does very little. Handled here, it genuinely fades the word out,
+on the same continuum as the table above — and `(word:0)` becomes a clean deletion.
+
+**Off by default** because `(word:0.8)` is common in ordinary prompts and this noticeably
+changes what those prompts produce. Turn it on if de-emphasis has felt like it does nothing.
+
+### Handle emphasis in attention
+
+**What it does:** takes over emphasis — weights above `1`, like `(word:1.5)` — and applies
+it by making the image pay more attention to that word, rather than by scaling the text
+embedding.
+
+**What you'll see:** emphasis that actually works. The usual kind runs into the same
+normalisation problem as de-emphasis above, which is why `(word:1.4)` on Krea 2 often looks
+much like `(word:1.0)`. Handled here, the emphasised word visibly takes over more of the
+image.
+
+**Off by default,** and it does cost a little speed while a prompt is using it. Turn it on
+if emphasis has felt inert.
+
+### Emphasis gain
+
+**What it does:** how much a weight above `1` is worth, for the setting above.
+
+**What you'll see:** the effect grows very quickly — going from `2.0` to `4.0` is far more
+than twice as strong, and it compounds through the model. If an emphasised word starts
+dominating the image, smearing, or crowding out everything else in the prompt, lower this
+before lowering your prompt weights. `1.0` is a good starting point if `2.0` feels wild.
+
+### Encode the prompt in one pass
+
+**What it does:** fixes something that happens to every weighted Krea 2 prompt, with or
+without this extension. Forge splits your prompt at each weight and sends the pieces to the
+text encoder separately — so `a portrait (blurry:-1.0) sharp` is read as three fragments
+rather than one sentence. This rejoins them, so the model reads exactly the prompt you would
+have written with no weights in it.
+
+**What you'll see:** weighted prompts stop drifting away from their unweighted versions.
+If you have noticed that adding a weight to a prompt changes the image more than the weight
+itself should account for — different composition, a different mood, not just more or less
+of the weighted word — this is the cause, and this is the fix. The weights then do nothing
+but the job you gave them.
+
+**Off by default** because it changes the output of every weighted prompt. Worth trying.
 
 ### Advanced
 
-| Control | Default | Description |
+| Setting | Default | What it does |
 | --- | --- | --- |
-| Also act inside the text-fusion refiners | off | Applies one stage earlier, while the text is still being fused and before any image token has read it. Stronger, and harder to control. |
-| First block / Last block | `0` / `27` | Which of Krea 2's 28 single-stream blocks are affected. Narrowing the range weakens the effect and localises it — early blocks lean towards composition, late blocks towards detail. |
-| Block stride | `1` | Act in every Nth block of the range. Another way to dial the effect down. |
+| Also act inside the text-fusion refiners | off | Applies the effect one stage earlier, before the image has read the text at all. Noticeably stronger and harder to steer — reach for it when a stubborn concept survives everything else. |
+| First block / Last block | `0` / `27` | Which part of the model is affected, out of 28 stages. Narrowing the range weakens the effect and changes its character: as a rule of thumb the early stages shape composition and layout, the later ones texture and detail. Restricting to late blocks can remove a *look* while leaving the arrangement of the image alone. |
+| Block stride | `1` | Apply in every Nth stage instead of all of them. Another way to soften the effect while keeping it spread across the whole model. |
 
-Everything is written to the infotext and pastes back from it.
+All settings are saved into the image's generation parameters and paste back from them.
 
-## Notes
+## If nothing seems to happen
 
-- **The weight is the dial.** At the default strength, a negative weight lands on the value
-  vector unchanged: `(word:-2.0)` subtracts twice as hard as `(word:-1.0)`, and `(word:0)`
-  merely deletes the word's contribution. A claimed weight is taken away from Forge's
-  emphasis pass entirely, so the magnitude is applied once, not twice.
-- **Scaling an embedding barely works on Krea 2.** Emphasis multiplies the Qwen3-VL hidden
-  states, and the text-fusion transformer's `RMSNorm` is scale-invariant — most of the
-  magnitude is normalised straight back out, and `EmphasisOriginal` then renormalises the
-  whole chunk's mean on top. An attention bias is additive in a space nothing normalises,
-  which is why *Handle emphasis in attention* exists. It costs the optimised attention
-  backend (sage/flash do not take an additive mask), so it is only switched in when a prompt
-  actually contains a weight above `1`.
-- **Anything not claimed behaves exactly as it does without this extension.** With both
-  opt-ins off, `(word:0.8)` and `(word:1.4)` go through Forge's emphasis untouched.
-- **A weight normally changes what the model reads, before any lever applies.**
-  `parse_prompt_attention` splits the prompt before the encoder sees it, and
-  `Qwen3VLTextProcessingEngine` then wraps *each piece* in the full chat template — so
-  `a portrait (blurry:-1.0) sharp` reaches the model as three templated encodes back to
-  back, system instruction and all, where the unweighted prompt would have been one. That
-  is Forge's own behaviour for any weighted Krea 2 prompt, with or without this extension.
-  *Encode the prompt in one pass* removes it: the conditioning becomes byte-identical to
-  the unweighted prompt. Worth trying if weighted prompts have felt oddly unlike their
-  unweighted versions. It is off by default because it changes the output of every
-  weighted prompt, and needs a fast tokenizer (it reports character offsets); without one
-  it quietly falls back to the per-segment path.
-- **Emphasis must be on.** If the *Emphasis* setting is `None`, Forge never parses `(x:-1)`
-  as a weight at all, so there is nothing to claim. The extension logs a warning and stands
+- **Check the console.** No `NegPiP Enable` line means it never engaged.
+- **Is the weight negative?** With the two opt-in settings off, only negative weights do
+  anything. `(word:1.5)` alone will not trigger it.
+- **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as
+  literal text and there is no weight to act on. The extension logs a warning and stands
   down.
-- **Hires. fix is covered** — the hires prompts are inspected too, and the patch spans both
-  passes.
-- **Text conditioning is re-encoded** when the extension is switched on, off, or retuned,
-  because Forge's conditioning cache is keyed on the prompt alone and knows nothing about
-  NegPiP. Repeat batches at unchanged settings reuse the cache as normal.
-- Nothing in `sd-webui-forge-classic` is modified; every patch is undone when the extension
-  stands down.
+- **Is the checkpoint Krea 2?** It deliberately does nothing on other models.
+
+## Good to know
+
+- **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies
+  across both passes.
+- **Re-encoding.** Switching the extension on, off, or changing any of its settings makes
+  the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
+- **Nothing is modified in Forge itself.** Every change is undone when the extension stands
+  down.
 
 ## How it works
 
-Ported from [blue-pen5805/ComfyUI-krea2-negpip](https://github.com/blue-pen5805/ComfyUI-krea2-negpip),
-itself a Krea 2 adaptation of [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip)'s
-original NegPiP.
-
-### Why the existing Forge port does not cover Krea 2
-
-[sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) has three paths, and Krea 2
-fits none of them. SD1 and SDXL encode the negative fragment separately, append it to the
-cross-attention context, and negate the tail of `to_v`. Anima rides a mask through its
-dedicated `SelfCrossAttention` module. Krea 2 has no cross-attention at all: it is
-single-stream, so the text tokens sit in the *same* self-attention sequence as the image
-patches (`backend/nn/krea.py`, `SingleStreamDiT.forward` concatenates them). And its
-conditioning is not an embedding — it is a 12-layer × 2560-feature Qwen3-VL tap stack that
-goes through a two-stage text-fusion transformer before any attention sees it.
-
-### The two halves
-
-**Weights out of band.** Forge's emphasis pass multiplies the encoder's hidden states by the
-prompt weight, so a negative weight arrives as a sign-flipped *hidden state*. On SD1/SDXL
-that is close enough — the conditioning feeds `to_k`/`to_v` directly, both linear. On
-Krea 2 the RMSNorm and SwiGLU of the text-fusion stack are not odd functions, so a negated
-tap stack is simply a *different prompt*, not an inverted one; and RMSNorm being
-scale-invariant, a *scaled* one is barely scaled at all. So a claimed weight is taken away
-from the emphasis pass — which sees a flat `1.0` for those segments — and travels alongside
-the conditioning as two per-token rows: a **value factor** and a **logit bias**.
-
-The ComfyUI node smuggles the same information through a sidecar token appended to the
-conditioning tensor, with magic constants and a checksum, because ComfyUI's graph gives it
-no other channel. Forge does have one: extra `model_conds` entries ride through
-`reconstruct_cond_batch` → `compile_conditions` → `apply_model` and land as keyword
-arguments on the diffusion model, batched and repeated in lockstep with the conditioning
-they describe. So the sidecar is gone, and with it every way it could be mangled — and
-because each row travels *with* its own conditioning, the positive and negative prompts
-cannot read each other's, which is what lets weights work in both at any CFG.
-
-**Act inside attention.** Both rows are applied in the DiT, after text fusion has run, over
-the leading `txtlen` positions — exactly the text half of the concatenated sequence.
-
-The value factor scales the output of each selected block's `wv`: attention still scores the
-token normally, then subtracts or damps what it contributes instead of adding it. The logit
-bias is added to the token's attention score, multiplying its softmax weight by `exp(bias)`
-for every query in the sequence — scaling a value vector cannot make the rest of the image
-attend to a word *more*, so amplification needs the other side of the softmax.
-
-Two hooks do it: the attention module's `forward` parks the value factors for the duration
-of one call and substitutes the bias for the `mask` argument (Krea 2 never passes one — the
-DiT hands `None` to every block), and its `wv` linear scales the rows it names. Nothing of
-Forge's own attention math is copied, so an upstream change to Krea 2's attention does not
-silently break either lever. The bias does need a backend that accepts an additive mask, so
-`krea.attention_function` is pointed at the plain SDPA path while one is in play, and put
-back afterwards.
-
-`txtfusion.layerwise_blocks` are deliberately left alone: they run at
-`(batch * seq, taps, dim)`, so their sequence axis is the 12-layer tap stack, and the rows
-do not index it.
-
-### Two smaller adjustments
-
-- **`compile_conditions` learns a third shape.** It knows a bare tensor, or a dict with both
-  `crossattn` and a pooled `vector`. NegPiP conditioning is `crossattn` plus the rows and no
-  pooled vector, which would have raised `KeyError: 'vector'`. The rows are registered as
-  plain `Condition`s rather than `ConditionCrossAttn`, so mismatched lengths refuse to batch
-  instead of being repeated to a common length — a repeated row would describe the wrong
-  tokens. The wrapper is installed on demand, is a straight pass-through for every other
-  shape, and is never removed — Forge caches compiled conditioning on the
-  `StableDiffusionProcessing` *class*, so a cond can outlive the run that made it.
-
-- **The rows cover the words, not the boilerplate.** `Qwen3VLTextProcessingEngine.tokenize`
-  wraps *every* weighted segment in the full chat template, so a prompt carrying weights
-  tokenises to several copies of the template with the fragments spliced between them.
-  Emphasis scales all of it, which is Forge's own behaviour and is what an unclaimed weight
-  still gets — but flipping the sign of the system instruction is not what `(word:-1.0)`
-  asks for. Both rows are confined to the fragment itself, located structurally inside each
-  templated segment rather than at an assumed offset.
-
-- **Or the extra templates never happen at all.** *Encode the prompt in one pass* rejoins
-  the parser's segments and encodes that once, locating each fragment by the character
-  offsets a fast tokenizer reports and assigning every token to whichever segment covers
-  most of its characters — so a BPE merge across a segment seam lands in exactly one of
-  them. The token stream still comes from `engine.tokenize`; the offsets only have to agree
-  with it, and are checked against it before being used. There is deliberately no second
-  localisation heuristic: when offsets are unavailable or disagree, it falls back to the
-  per-segment path above, which is a real tested encoder rather than a guess at where a
-  fragment landed.
+See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the implementation: why the existing Forge NegPiP
+port does not cover Krea 2, how the weights reach the model, and how it is tested.
 
 ## Credits
 

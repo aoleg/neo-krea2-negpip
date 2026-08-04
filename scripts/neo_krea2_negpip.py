@@ -65,7 +65,7 @@ class Krea2NegPiP(scripts.Script):
 
     def ui(self, is_img2img):
         with InputAccordion(False, label=self.title()) as enable:
-            gr.Markdown("Give a word a negative weight to suppress it: `(blurry:-1.0)` in the positive prompt, or in the negative prompt to enforce it instead. `(word:0)` removes it outright.")
+            gr.Markdown("Give a word a negative weight to suppress it: `(blurry:-1.0)` in the positive prompt, or in the negative prompt to enforce it instead.")
 
             value_strength = gr.Slider(
                 minimum=0.0,
@@ -79,7 +79,7 @@ class Krea2NegPiP(scripts.Script):
             handle_deemphasis = gr.Checkbox(
                 False,
                 label="Handle de-emphasis too",
-                info="claim weights between 0 and 1 as well, instead of leaving them to the ordinary emphasis pass",
+                info="claim weights from 0 up to 1 as well, instead of leaving them to the ordinary emphasis pass; needed for (word:0) to delete a word outright",
             )
 
             handle_emphasis = gr.Checkbox(
