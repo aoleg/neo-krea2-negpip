@@ -259,7 +259,12 @@ def _hook_attention(attn: Any, role: str = "", remove: bool = False):
 
         setattr(attn, ACTIVE_ATTR, options.get(NEGPIP_OPTION_KEY, None))
         try:
-            return original(x, freqs, mask, transformer_options)
+            #   by keyword past the required positional: a parameter interposed before
+            #   `transformer_options` would otherwise silently take our options dict and
+            #   leave the real one at its default, which is a working forward pass that
+            #   quietly does nothing.  The ComfyUI node hit exactly this when Krea 2 Edit
+            #   added `ref_latents` to the signature there.
+            return original(x, freqs=freqs, mask=mask, transformer_options=transformer_options)
         finally:
             setattr(attn, ACTIVE_ATTR, None)
 
@@ -297,7 +302,8 @@ def _hook_dit(dit: Any, remove: bool):
         if torch.is_tensor(bias):
             options[NEGPIP_BIAS_OPTION_KEY] = bias.reshape(bias.shape[0], -1, 1)
 
-        return original(x, timesteps, context, attention_mask, options, **kwargs)
+        #   keyword past the required positionals, for the reason in `_hook_attention`
+        return original(x, timesteps, context, attention_mask=attention_mask, transformer_options=options, **kwargs)
 
     negpip_forward._negpip = True
 

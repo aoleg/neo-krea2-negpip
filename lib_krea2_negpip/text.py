@@ -276,7 +276,22 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
     """One prompt line -> `(conditioning, value factors, logit biases, claimed tokens)`."""
     tokens, multipliers, factors, biases = _tokenize_line(engine, line, config)
 
+    global _warned_expanded
+
     z = engine.process_tokens([tokens], [multipliers])  # (1, taps, seq, dim)
+
+    #   a token is not always one sequence position: `process_embeds` splices an embedding
+    #   in over several, so a row indexed by *token* stops describing the conditioning.
+    #   There is no realignment to attempt that would not duplicate that splice, and Forge
+    #   guards the identical hazard by skipping emphasis outright when the lengths
+    #   disagree.  Unreachable today — only the image path makes non-integer tokens, and
+    #   that path is handed back to Forge whole — but silently misplacing a sign flip is
+    #   not a failure worth leaving unguarded.
+    aligned = int(z.shape[2]) == len(tokens)
+    if not aligned and not _warned_expanded:
+        _warned_expanded = True
+        logger.warning("NegPiP: the encoder expanded the token stream, so the weights cannot be placed; leaving this prompt alone")
+
     template_end = _template_end(engine, tokens, z.shape[2])
     z = z[:, :, template_end:]
 
@@ -288,8 +303,8 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
     #   1 and the leading axis is the token count.
     z = z.permute(0, 2, 1, 3).reshape(batch * seq, taps, dim)
 
-    visible_factors = _row(factors[template_end:], seq, 1.0)
-    visible_biases = _row(biases[template_end:], seq, 0.0)
+    visible_factors = _row(factors[template_end:], seq, 1.0) if aligned else [1.0] * seq
+    visible_biases = _row(biases[template_end:], seq, 0.0) if aligned else [0.0] * seq
 
     def column(values: list[float]) -> torch.Tensor:
         #   indexed 1:1 with the conditioning's leading axis, so Forge's own batching and
@@ -302,6 +317,7 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
 
 
 _warned_reference = False
+_warned_expanded = False
 
 
 def _reference_active(model: "Krea2", prompt) -> bool:
