@@ -9,13 +9,19 @@ first attention layer (`backend/nn/krea.py`, `TextFusionTransformer`).  RMSNorm 
 are not odd functions, so a negated Qwen3-VL tap stack is simply a different prompt, not
 an inverted one.
 
-So the sign is stripped here and carried out of band: the emphasis pass gets `abs(weight)`
-— the magnitude NegPiP always intended — and the positions that were negative are handed
-to the diffusion model as a `+1 / -strength` mask, to be applied to the *value* vectors
-inside attention, after text fusion has run.  See `dit.py`.
+So a weight this extension claims is taken away from the emphasis pass entirely — it gets
+a flat `1.0` for those segments — and is handed to the diffusion model out of band, as two
+per-token rows applied inside attention after text fusion has run:
 
-The mask is built over the exact token stream the multipliers are built over, and sliced
-at the exact same `strip_template` offset, so the two cannot drift apart.
+* a **value factor**, multiplied into the value vectors (`WeightConfig.value_factor`);
+* a **logit bias**, added to the attention scores (`WeightConfig.logit_bias`).
+
+A weight the config does not claim is left alone and reaches emphasis as `abs(weight)`,
+which is Forge's own behaviour minus the sign that text fusion would have eaten.  See
+`dit.py` for the consuming end.
+
+Both rows are built over the exact token stream the multipliers are built over, and sliced
+at the exact same `strip_template` offset, so they cannot drift apart.
 """
 
 from functools import wraps
@@ -33,7 +39,7 @@ from backend.text_processing import emphasis
 from modules.processing import logger
 from modules.shared import opts
 
-from lib_krea2_negpip import NEGPIP_MASK_KEY
+from lib_krea2_negpip import NEGPIP_BIAS_KEY, NEGPIP_MASK_KEY, WeightConfig
 from lib_krea2_negpip.prompts import weighted_segments
 
 ORIGINAL_ATTR = "_krea2_negpip_original_conditioning"
@@ -56,10 +62,10 @@ def _segment_text_span(engine: "Qwen3VLTextProcessingEngine", segment: list) -> 
     `Qwen3VLTextProcessingEngine.tokenize` wraps *every* weighted segment in the whole
     chat template, so a prompt carrying weights tokenises to several copies of the
     template with the fragments spliced between them.  Emphasis scales all of it — that
-    is Forge's own behaviour for positive weights and is left alone — but a sign flip on
-    the system instruction is not what `(word:-1.0)` asks for.  The mask is confined to
-    the fragment: everything between `<|im_start|>user\\n` and the `<|im_end|>` that ends
-    the user turn.
+    is Forge's own behaviour, and a weight this extension does not claim keeps it — but
+    scaling the system instruction is not what `(word:-1.0)` asks for.  Both rows are
+    confined to the fragment: everything between `<|im_start|>user\\n` and the
+    `<|im_end|>` that ends the user turn.
 
     Falls back to the whole segment if the landmarks are not where the template puts
     them, which is also what happens for a prompt already written as raw chat markup.
@@ -81,8 +87,13 @@ def _segment_text_span(engine: "Qwen3VLTextProcessingEngine", segment: list) -> 
     return start, end
 
 
-def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str) -> tuple[list, list[float], list[bool]]:
-    """`Qwen3VLTextProcessingEngine.tokenize_line`, with the sign split off the weight.
+def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
+    """`Qwen3VLTextProcessingEngine.tokenize_line`, with the claimed weights split off.
+
+    Returns the token stream plus three rows indexed by it: the emphasis multipliers, the
+    value factors and the logit biases.  A segment is either the emphasis pass's or ours,
+    never both — a claimed weight leaves `1.0` behind in the multipliers, so the magnitude
+    is applied once, at the lever that can carry it.
 
     Krea 2 conditioning in Forge never carries images — `Krea2.get_learned_conditioning`
     calls the engine with the text only — so the image-placeholder branch of the original
@@ -93,19 +104,27 @@ def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str) -> tuple[li
 
     tokens: list = []
     multipliers: list[float] = []
-    negatives: list[bool] = []
+    factors: list[float] = []
+    biases: list[float] = []
 
     for segment, (_, weight) in zip(tokenized, parsed):
-        negative = weight < 0.0
-        magnitude = abs(weight)
-        start, end = _segment_text_span(engine, segment) if negative else (0, 0)
+        factor = config.value_factor(weight)
+        bias = config.logit_bias(weight)
+        claimed = factor != 1.0 or bias != 0.0
+
+        #   `abs`, not the signed weight: a negated hidden state is a different prompt,
+        #   not an inverted one, and that is the whole reason this extension exists
+        multiplier = 1.0 if claimed else abs(weight)
+        start, end = _segment_text_span(engine, segment) if claimed else (0, 0)
 
         for i, token in enumerate(segment):
+            inside = start <= i < end
             tokens.append(token)
-            multipliers.append(magnitude)
-            negatives.append(negative and start <= i < end)
+            multipliers.append(multiplier)
+            factors.append(factor if inside else 1.0)
+            biases.append(bias if inside else 0.0)
 
-    return tokens, multipliers, negatives
+    return tokens, multipliers, factors, biases
 
 
 def _template_end(engine: "Qwen3VLTextProcessingEngine", tokens: list, seq_len: int) -> int:
@@ -134,9 +153,15 @@ def _template_end(engine: "Qwen3VLTextProcessingEngine", tokens: list, seq_len: 
     return template_end
 
 
-def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, strength: float) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """One prompt line -> `(conditioning, negpip mask, negative token count)`."""
-    tokens, multipliers, negatives = _tokenize_line(engine, line)
+def _row(values: list[float], seq: int, default: float) -> list[float]:
+    """One per-token row, cut or padded to the conditioning's own sequence length."""
+    row = values[:seq]
+    return row + [default] * (seq - len(row))
+
+
+def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """One prompt line -> `(conditioning, value factors, logit biases, claimed tokens)`."""
+    tokens, multipliers, factors, biases = _tokenize_line(engine, line, config)
 
     z = engine.process_tokens([tokens], [multipliers])  # (1, taps, seq, dim)
     template_end = _template_end(engine, tokens, z.shape[2])
@@ -145,13 +170,15 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, strength: flo
     batch, taps, seq, dim = z.shape
     z = z.permute(0, 2, 1, 3).reshape(batch, seq, taps * dim)
 
-    positions = [i for i, negative in enumerate(negatives[template_end : template_end + seq]) if negative]
+    visible_factors = _row(factors[template_end:], seq, 1.0)
+    visible_biases = _row(biases[template_end:], seq, 0.0)
 
-    mask = torch.ones((batch, seq, 1), device=z.device, dtype=z.dtype)
-    if positions:
-        mask[:, positions, 0] = -strength
+    def column(values: list[float]) -> torch.Tensor:
+        return torch.tensor(values, device=z.device, dtype=z.dtype).reshape(1, seq, 1).expand(batch, seq, 1).contiguous()
 
-    return z, mask, len(positions)
+    count = sum(1 for factor, bias in zip(visible_factors, visible_biases) if factor != 1.0 or bias != 0.0)
+
+    return z, column(visible_factors), column(visible_biases), count
 
 
 def _report(prompt, count: int):
@@ -162,13 +189,16 @@ def _report(prompt, count: int):
     logger.info(f"NegPiP Enable ({key}: {count})")
 
 
-def patch_text_encoder(model: "Krea2", strength: float):
-    """Replace `Krea2.get_learned_conditioning` with the mask-producing version.
+def patch_text_encoder(model: "Krea2", config: WeightConfig):
+    """Replace `Krea2.get_learned_conditioning` with the row-producing version.
 
     The result is a `dict` of *lists* rather than stacked tensors: prompt scheduling
     (`[a:b:0.5]`) hands the engine several lines of different token counts in one call,
     and `prompt_parser.get_learned_conditioning` indexes whatever comes back per schedule
     entry — a list indexes fine where `torch.stack` would have raised.
+
+    Which keys the dict carries follows the *config*, not this batch's prompts, so cond
+    and uncond always agree on the shape even when only one of them uses a lever.
     """
     if getattr(model, ORIGINAL_ATTR, None) is not None:
         return
@@ -187,23 +217,31 @@ def patch_text_encoder(model: "Krea2", strength: float):
 
         conds: list[torch.Tensor] = []
         masks: list[torch.Tensor] = []
-        cache: dict[str, tuple[torch.Tensor, torch.Tensor, int]] = {}
+        biases: list[torch.Tensor] = []
+        cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = {}
         count = 0
 
         for line in prompt:
             encoded = cache.get(line)
             if encoded is None:
-                encoded = _encode_line(engine, line, strength)
+                encoded = _encode_line(engine, line, config)
                 cache[line] = encoded
 
-            z, mask, negatives = encoded
+            z, mask, bias, claimed = encoded
             conds.append(z)
             masks.append(mask)
-            count += negatives
+            biases.append(bias)
+            count += claimed
 
         _report(prompt, count)
 
-        return {"crossattn": conds, NEGPIP_MASK_KEY: masks}
+        result = {"crossattn": conds}
+        if config.uses_value:
+            result[NEGPIP_MASK_KEY] = masks
+        if config.uses_bias:
+            result[NEGPIP_BIAS_KEY] = biases
+
+        return result
 
     negpip_get_learned_conditioning._negpip = True
 

@@ -8,6 +8,8 @@ if TYPE_CHECKING:
 from backend.text_processing import emphasis, parsing
 from modules.shared import opts
 
+from lib_krea2_negpip import WeightConfig
+
 #   `parse_prompt_attention` marks a BREAK with the sentinel weight -1.  It is not a
 #   weighted token and must never be read as one — sd-webui-negpip skips the same set.
 SENTINELS = frozenset({"BREAK", "AND", "ADDCOL", "ADDROW"})
@@ -25,20 +27,30 @@ def weighted_segments(line: str, emphasis_name: str) -> list[tuple[str, float]]:
     return [(text, 1.0 if text.strip() in SENTINELS else float(weight)) for text, weight in parsing.parse_prompt_attention(line, emphasis_name)]
 
 
-def has_negative(line: str, emphasis_name: str) -> bool:
-    return any(weight < 0.0 for _, weight in weighted_segments(line, emphasis_name))
+def scan(p: "StableDiffusionProcessing", config: WeightConfig) -> tuple[bool, bool]:
+    """`(any weight this config claims, any weight that needs a logit bias)`.
 
-
-def any_negative(p: "StableDiffusionProcessing") -> bool:
-    """Whether any prompt of this batch — including the Hires. fix pass — asks for NegPiP."""
+    Both answers come out of one parse over every prompt of the batch, the Hires. fix
+    pass included.  The second one decides whether the attention backend has to be forced
+    to the one that accepts an additive mask, which is a cost worth avoiding when nothing
+    in the prompt asks for amplification.
+    """
     emphasis_name = current_emphasis_name()
+    handled = biased = False
 
     for field in PROMPT_FIELDS:
         for line in getattr(p, field, None) or ():
-            if isinstance(line, str) and has_negative(line, emphasis_name):
-                return True
+            if not isinstance(line, str):
+                continue
 
-    return False
+            for _, weight in weighted_segments(line, emphasis_name):
+                handled = handled or config.handles(weight)
+                biased = biased or config.logit_bias(weight) != 0.0
+
+                if handled and biased:
+                    return True, True
+
+    return handled, biased
 
 
 def reset_prompt_cache(p: "StableDiffusionProcessing"):

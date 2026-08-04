@@ -14,22 +14,26 @@ non-linear text-fusion transformer before any attention sees it.
 
 So the port keeps the ComfyUI node's two halves and re-plumbs the middle:
 
-* `lib_krea2_negpip/text.py` — hand the emphasis pass `abs(weight)` and carry the sign
-  out of band as a `+1 / -strength` mask alongside the conditioning.  The ComfyUI node
-  smuggles the same information through a sidecar token appended to the conditioning
-  tensor, because ComfyUI has no clean channel for it; Forge does, so this uses one.
-* `lib_krea2_negpip/dit.py` — apply the mask to the value projection inside the DiT,
-  after text fusion has run.
+* `lib_krea2_negpip/text.py` — take the claimed weights away from the emphasis pass and
+  carry them out of band, as per-token value factors and logit biases alongside the
+  conditioning.  The ComfyUI node smuggles the same information through a sidecar token
+  appended to the conditioning tensor, because ComfyUI has no clean channel for it; Forge
+  does, so this uses one, which is also what keeps cond and uncond from reading each
+  other's rows.
+* `lib_krea2_negpip/dit.py` — apply them inside the DiT's attention, after text fusion
+  has run.
 
 Which leaves `compile_conditions`, which only knows a bare tensor or a `crossattn` +
 pooled `vector` dict; it gets taught the third shape.  See `dit.py`.
 """
 
+from dataclasses import replace
+
 import gradio as gr
 
-from lib_krea2_negpip import KREA2_ENGINE
+from lib_krea2_negpip import KREA2_ENGINE, MAX_GAIN, MAX_STRENGTH, WeightConfig
 from lib_krea2_negpip.dit import is_krea2_dit, patch_dit, unpatch_dit
-from lib_krea2_negpip.prompts import any_negative, current_emphasis_name, reset_prompt_cache
+from lib_krea2_negpip.prompts import current_emphasis_name, reset_prompt_cache, scan
 from lib_krea2_negpip.text import patch_text_encoder, unpatch_text_encoder
 
 from modules import scripts
@@ -38,8 +42,6 @@ from modules.ui_components import InputAccordion
 
 #   Krea 2 is 28 single-stream blocks; the sliders are clamped to the real count anyway
 DEFAULT_LAST_BLOCK = 27
-
-MAX_STRENGTH = 8.0
 
 
 class Krea2NegPiP(scripts.Script):
@@ -63,7 +65,7 @@ class Krea2NegPiP(scripts.Script):
 
     def ui(self, is_img2img):
         with InputAccordion(False, label=self.title()) as enable:
-            gr.Markdown("Give a word a negative weight to suppress it: `(blurry:-1.0)` in the positive prompt, or in the negative prompt to enforce it instead.")
+            gr.Markdown("Give a word a negative weight to suppress it: `(blurry:-1.0)` in the positive prompt, or in the negative prompt to enforce it instead. `(word:0)` removes it outright.")
 
             value_strength = gr.Slider(
                 minimum=0.0,
@@ -71,13 +73,34 @@ class Krea2NegPiP(scripts.Script):
                 value=1.0,
                 step=0.05,
                 label="Value strength",
-                info="how hard the flagged tokens are subtracted; 1.0 is a plain sign flip, 0.0 is off",
+                info="how far the weight is taken; 1.0 makes (word:-1.0) a plain sign flip, 0.0 is off",
+            )
+
+            handle_deemphasis = gr.Checkbox(
+                False,
+                label="Handle de-emphasis too",
+                info="claim weights between 0 and 1 as well, instead of leaving them to the ordinary emphasis pass",
+            )
+
+            handle_emphasis = gr.Checkbox(
+                False,
+                label="Handle emphasis in attention",
+                info="make weights above 1 raise how much the image attends to the word, which survives the text-fusion norms — scaling the embedding largely does not",
+            )
+
+            emphasis_gain = gr.Slider(
+                minimum=0.0,
+                maximum=MAX_GAIN,
+                value=2.0,
+                step=0.05,
+                label="Emphasis gain",
+                info="attention weight is multiplied by exp(gain x (weight - 1)), so this compounds quickly over blocks",
             )
 
             with gr.Accordion("Advanced", open=False):
                 patch_txtfusion_refiners = gr.Checkbox(
                     False,
-                    label="Also flip inside the text-fusion refiners",
+                    label="Also act inside the text-fusion refiners",
                     info="stronger, and applies before the image tokens ever see the text",
                 )
 
@@ -85,18 +108,21 @@ class Krea2NegPiP(scripts.Script):
                     block_start = gr.Slider(minimum=0, maximum=DEFAULT_LAST_BLOCK, value=0, step=1, label="First block")
                     block_end = gr.Slider(minimum=0, maximum=DEFAULT_LAST_BLOCK, value=DEFAULT_LAST_BLOCK, step=1, label="Last block")
 
-                block_stride = gr.Slider(minimum=1, maximum=16, value=1, step=1, label="Block stride", info="flip in every Nth block of the range")
+                block_stride = gr.Slider(minimum=1, maximum=16, value=1, step=1, label="Block stride", info="act in every Nth block of the range")
 
         self.infotext_fields = [
             (enable, lambda d: "Krea2 NegPiP value strength" in d),
             (value_strength, "Krea2 NegPiP value strength"),
+            (handle_deemphasis, "Krea2 NegPiP de-emphasis"),
+            (handle_emphasis, "Krea2 NegPiP emphasis"),
+            (emphasis_gain, "Krea2 NegPiP emphasis gain"),
             (patch_txtfusion_refiners, "Krea2 NegPiP refiners"),
             (block_start, "Krea2 NegPiP first block"),
             (block_end, "Krea2 NegPiP last block"),
             (block_stride, "Krea2 NegPiP block stride"),
         ]
 
-        return [enable, value_strength, patch_txtfusion_refiners, block_start, block_end, block_stride]
+        return [enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, patch_txtfusion_refiners, block_start, block_end, block_stride]
 
     # ============================================================================ #
 
@@ -126,7 +152,7 @@ class Krea2NegPiP(scripts.Script):
         cls.warned_emphasis = True
         logger.warning('NegPiP needs prompt emphasis parsing; Emphasis is set to "None", so negative weights are read as literal text')
 
-    def _resolve(self, p, enable, value_strength, patch_txtfusion_refiners, block_start, block_end, block_stride):
+    def _resolve(self, p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, patch_txtfusion_refiners, block_start, block_end, block_stride):
         """UI arguments + this batch's prompts -> what to patch, or `None` to stand down."""
         if not enable:
             return None
@@ -135,16 +161,29 @@ class Krea2NegPiP(scripts.Script):
         if model is None or type(model).__name__ != KREA2_ENGINE:
             return None
 
-        strength = min(MAX_STRENGTH, max(0.0, float(value_strength)))
-        if strength == 0.0:
+        config = WeightConfig(
+            strength=min(MAX_STRENGTH, max(0.0, float(value_strength))),
+            deemphasis=bool(handle_deemphasis),
+            emphasis=bool(handle_emphasis),
+            gain=min(MAX_GAIN, max(0.0, float(emphasis_gain))),
+        )
+
+        if not (config.uses_value or config.uses_bias):
             return None
 
         if current_emphasis_name() == "None":
             self._warn_emphasis()
             return None
 
-        if not any_negative(p):
+        claimed, biased = scan(p, config)
+        if not claimed:
             return None
+
+        #   the emphasis lever ticked with nothing above 1.0 in the prompt has to switch
+        #   itself off, not merely produce an all-zero row: emitting the row at all means
+        #   handing the attention backend a float mask, and the optimised ones do not
+        #   take one.  The config the model sees is the one this batch actually needs.
+        active = config if biased else replace(config, emphasis=False)
 
         try:
             dit = model.forge_objects.unet.model.diffusion_model
@@ -159,16 +198,17 @@ class Krea2NegPiP(scripts.Script):
             "block_end": int(block_end),
             "block_stride": int(block_stride),
             "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
+            "force_pytorch_attention": active.uses_bias,
         }
 
-        signature = (id(model), id(dit), strength, tuple(sorted(options.items())))
+        signature = (id(model), id(dit), active, tuple(sorted(options.items())))
 
-        return model, dit, strength, options, signature
+        return model, dit, config, active, options, signature
 
-    def process_batch(self, p, enable, value_strength, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
+    def process_batch(self, p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
         cls = Krea2NegPiP
 
-        resolved = self._resolve(p, enable, value_strength, patch_txtfusion_refiners, block_start, block_end, block_stride)
+        resolved = self._resolve(p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, patch_txtfusion_refiners, block_start, block_end, block_stride)
 
         if resolved is None:
             cls._teardown()
@@ -177,9 +217,16 @@ class Krea2NegPiP(scripts.Script):
             cls._reset_cache(p)
             return
 
-        model, dit, strength, options, signature = resolved
+        #   `config` is what the UI asked for and is what the infotext records; `active`
+        #   is what this batch's prompts actually need patching for
+        model, dit, config, active, options, signature = resolved
 
-        params = {"Krea2 NegPiP value strength": strength}
+        params = {"Krea2 NegPiP value strength": config.strength}
+        if config.deemphasis:
+            params["Krea2 NegPiP de-emphasis"] = True
+        if config.emphasis:
+            params["Krea2 NegPiP emphasis"] = True
+            params["Krea2 NegPiP emphasis gain"] = config.gain
         if options["patch_txtfusion_refiners"]:
             params["Krea2 NegPiP refiners"] = True
         if options["block_start"] != 0:
@@ -197,7 +244,7 @@ class Krea2NegPiP(scripts.Script):
 
         cls._teardown()
 
-        patch_text_encoder(model, strength)
+        patch_text_encoder(model, active)
         hooked = patch_dit(dit, **options)
 
         cls.model = model
@@ -209,7 +256,7 @@ class Krea2NegPiP(scripts.Script):
         reset_prompt_cache(p)
         p.extra_generation_params.update(params)
 
-        logger.debug(f"NegPiP patched {hooked} attention modules")
+        logger.debug(f"NegPiP patched {hooked} attention modules{', SDPA forced' if options['force_pytorch_attention'] else ''}")
 
     def postprocess(self, p, processed, *args):
         Krea2NegPiP._teardown()
