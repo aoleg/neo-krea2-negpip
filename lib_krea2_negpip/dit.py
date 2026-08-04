@@ -72,14 +72,23 @@ _warned_mask = False
 
 
 def is_krea2_dit(dit: Any) -> bool:
-    """Whether this diffusion model really is the Krea 2 `SingleStreamDiT`."""
+    """Whether this diffusion model really is the Krea 2 `SingleStreamDiT`.
+
+    Duck-typed on what this extension actually touches, and nothing else: Forge moved the
+    tap-stack unpacking out of the DiT and into the text engine, and detecting on the
+    `_unpack_context` that used to do it made the extension stand down silently — the
+    worst possible failure, since everything else still looked healthy.
+    """
     try:
         txtlayers = int(getattr(dit, "txtlayers", 0))
         txtdim = int(getattr(dit, "txtdim", 0))
     except (TypeError, ValueError):
         return False
 
-    return hasattr(dit, "blocks") and hasattr(dit, "txtfusion") and hasattr(dit, "txtmlp") and hasattr(dit, "_unpack_context") and txtlayers == KREA2_TAP_LAYERS and txtdim == KREA2_TAP_DIM
+    if txtlayers != KREA2_TAP_LAYERS or txtdim != KREA2_TAP_DIM:
+        return False
+
+    return hasattr(dit, "blocks") and hasattr(dit, "txtmlp") and hasattr(getattr(dit, "txtfusion", None), "refiner_blocks")
 
 
 def selected_blocks(count: int, start: int, end: int, stride: int) -> list[int]:
@@ -281,8 +290,8 @@ def _hook_dit(dit: Any, remove: bool):
         bias = kwargs.pop(NEGPIP_BIAS_KEY, None)
         options = dict(transformer_options or {})
 
-        #   conditioning arrives as (batch, 1, seq, features) — Krea 2 squeezes the
-        #   singleton itself — so both rows arrive as (batch, 1, seq, 1)
+        #   conditioning arrives as (batch, seq, taps, dim), so a row indexed 1:1 with its
+        #   token axis arrives as (batch, seq, 1, 1)
         if torch.is_tensor(mask):
             options[NEGPIP_OPTION_KEY] = mask.reshape(mask.shape[0], -1, 1)
         if torch.is_tensor(bias):

@@ -168,17 +168,41 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
     z = z[:, :, template_end:]
 
     batch, taps, seq, dim = z.shape
-    z = z.permute(0, 2, 1, 3).reshape(batch, seq, taps * dim)
+
+    #   `strip_template` flattens the tap axis into the features and `Qwen3VLTextProcessing
+    #   Engine.__call__` unpacks it straight back out with the *token* axis leading, which
+    #   is the shape `SingleStreamDiT.txtfusion` reads.  One line at a time, so `batch` is
+    #   1 and the leading axis is the token count.
+    z = z.permute(0, 2, 1, 3).reshape(batch * seq, taps, dim)
 
     visible_factors = _row(factors[template_end:], seq, 1.0)
     visible_biases = _row(biases[template_end:], seq, 0.0)
 
     def column(values: list[float]) -> torch.Tensor:
-        return torch.tensor(values, device=z.device, dtype=z.dtype).reshape(1, seq, 1).expand(batch, seq, 1).contiguous()
+        #   indexed 1:1 with the conditioning's leading axis, so Forge's own batching and
+        #   scheduling code keeps the two together without any realignment of ours
+        return torch.tensor(values, device=z.device, dtype=z.dtype).reshape(batch * seq, 1, 1)
 
     count = sum(1 for factor, bias in zip(visible_factors, visible_biases) if factor != 1.0 or bias != 0.0)
 
     return z, column(visible_factors), column(visible_biases), count
+
+
+_warned_reference = False
+
+
+def _reference_active(model: "Krea2", prompt) -> bool:
+    """Whether `Krea2.get_learned_conditioning` would take its reference-image branch.
+
+    Read-only — the original consumes `ini_latent` and clears `ref_latents` itself, and
+    doing that here as well would eat the state before Forge ever sees it.
+    """
+    if getattr(prompt, "is_negative_prompt", False):
+        return False
+    if not getattr(opts, "krea2_do_reference", False):
+        return False
+
+    return bool(getattr(model, "ref_latents", None)) or getattr(model, "ini_latent", None) is not None
 
 
 def _report(prompt, count: int):
@@ -209,7 +233,27 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
     @torch.inference_mode()
     @wraps(original)
     def negpip_get_learned_conditioning(prompt):
+        global _warned_reference
+
+        if _reference_active(model, prompt):
+            #   Krea 2 Edit encodes the prompt alongside reference images, on a path that
+            #   carries no per-token rows.  Hand the whole call back rather than half-apply
+            #   it, and say so — silently dropping the weights is how this went unnoticed
+            #   the last time the framework moved underneath the extension.
+            if not _warned_reference:
+                _warned_reference = True
+                logger.warning("NegPiP does not apply to the Krea 2 reference/Edit path; the positive prompt's weights are ignored there")
+            return original(prompt)
+
         memory_management.load_model_gpu(model.forge_objects.clip.patcher)
+
+        if not getattr(prompt, "is_negative_prompt", False):
+            #   the bookkeeping `Krea2.get_learned_conditioning` does before encoding, and
+            #   which this replaces: the img2img latent is consumed and the reference list
+            #   dropped, so a stale one cannot put the DiT into edit mode
+            if hasattr(model, "ini_latent"):
+                model.ini_latent = None
+            dynamic_args.ref_latents.clear()
 
         engine.emphasis = emphasis.get_current_option(opts.emphasis)()
         if any(emphasis.uses_emphasis(line) for line in prompt):
