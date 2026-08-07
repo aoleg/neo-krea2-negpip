@@ -38,7 +38,6 @@ from lib_krea2_negpip.text import patch_text_encoder, unpatch_text_encoder
 
 from modules import scripts
 from modules.processing import logger
-from modules.ui_components import InputAccordion
 
 #   Krea 2 is 28 single-stream blocks; the sliders are clamped to the real count anyway
 DEFAULT_LAST_BLOCK = 27
@@ -64,7 +63,12 @@ class Krea2NegPiP(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with InputAccordion(False, label=self.title()) as enable:
+        #   a plain Accordion, not an InputAccordion: the latter's open state *is* its value, so
+        #   a `.../NegPiP (Krea 2)/value: true` in ui-config.json — the way to have NegPiP on by
+        #   default — would also force the panel open at every launch
+        with gr.Accordion(label=self.title(), open=False, elem_id=self.elem_id("accordion")):
+            enable = gr.Checkbox(False, label="Enable", elem_id=self.elem_id("enable"))
+
             gr.Markdown("Give a word a negative weight to suppress it: `(blurry:-1.0)` in the positive prompt, or in the negative prompt to enforce it instead.")
 
             value_strength = gr.Slider(
