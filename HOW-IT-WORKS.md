@@ -1,126 +1,73 @@
 # How Neo Krea 2 NegPiP works
 
-Implementation notes for anyone reading or modifying the code. Nothing here is needed to
-use the extension — see the [README](README.md) for that.
+Implementation notes for anyone reading or modifying the code. Nothing here is needed to use the extension — see the [README](README.md) for that.
 
-Ported from [blue-pen5805/ComfyUI-krea2-negpip](https://github.com/blue-pen5805/ComfyUI-krea2-negpip),
-itself a Krea 2 adaptation of [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip)'s
-original NegPiP.
+Ported from [blue-pen5805/ComfyUI-krea2-negpip](https://github.com/blue-pen5805/ComfyUI-krea2-negpip), itself a Krea 2 adaptation of [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip)'s original NegPiP.
+
+## Relationship to upstream
+
+This repository is a fork that keeps the *idea* and none of the code: the ComfyUI node was removed when the port landed, so there is nothing here for an upstream merge to touch. Two things follow from that, and both are worth re-checking rather than assuming.
+
+Upstream's ComfyUI-side compatibility fixes generally do not have counterparts here, because the framework underneath is different. `ref_latents` becoming a positional argument on ComfyUI's diffusion-model wrapper is one: Forge Neo's `SingleStreamDiT.forward` reads reference latents from `dynamic_args.ref_latents` instead, and `dit.py` calls every wrapped forward by keyword past the required positionals specifically so that class of change cannot silently reroute an argument. Batching several token rows into one `clip.encode` call is another: Forge's engine encodes one chunk at a time.
+
+The *hazards* those fixes describe are worth reading even when the fix itself does not port. The row-batching one is really about a non-integer token expanding into several sequence positions, which would leave the per-token rows indexing the wrong tokens — `_encode_line` guards that with its `aligned` check, and stands the prompt down rather than misplacing a sign flip.
 
 ## Why the existing Forge port does not cover Krea 2
 
-[sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) has three paths, and Krea 2
-fits none of them. SD1 and SDXL encode the negative fragment separately, append it to the
-cross-attention context, and negate the tail of `to_v`. Anima rides a mask through its
-dedicated `SelfCrossAttention` module. Krea 2 has no cross-attention at all: it is
-single-stream, so the text tokens sit in the *same* self-attention sequence as the image
-patches (`backend/nn/krea.py`, `SingleStreamDiT.forward` concatenates them). And its
-conditioning is not an embedding — it is a 12-layer × 2560-feature Qwen3-VL tap stack that
-goes through a two-stage text-fusion transformer before any attention sees it.
+[sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) has three paths, and Krea 2 fits none of them. SD1 and SDXL encode the negative fragment separately, append it to the cross-attention context, and negate the tail of `to_v`. Anima rides a mask through its dedicated `SelfCrossAttention` module. Krea 2 has no cross-attention at all: it is single-stream, so the text tokens sit in the *same* self-attention sequence as the image patches (`backend/nn/krea.py`, `SingleStreamDiT.forward` concatenates them). And its conditioning is not an embedding — it is a 12-layer × 2560-feature Qwen3-VL tap stack that goes through a two-stage text-fusion transformer before any attention sees it.
 
 ## The two halves
 
-**Weights out of band.** Forge's emphasis pass multiplies the encoder's hidden states by the
-prompt weight, so a negative weight arrives as a sign-flipped *hidden state*. On SD1/SDXL
-that is close enough — the conditioning feeds `to_k`/`to_v` directly, both linear. On
-Krea 2 the RMSNorm and SwiGLU of the text-fusion stack are not odd functions, so a negated
-tap stack is simply a *different prompt*, not an inverted one; and RMSNorm being
-scale-invariant, a *scaled* one is barely scaled at all. So a claimed weight is taken away
-from the emphasis pass — which sees a flat `1.0` for those segments — and travels alongside
-the conditioning as two per-token rows: a **value factor** and a **logit bias**.
+**Weights out of band.** Forge's emphasis pass multiplies the encoder's hidden states by the prompt weight, so a negative weight arrives as a sign-flipped *hidden state*. On SD1/SDXL that is close enough — the conditioning feeds `to_k`/`to_v` directly, both linear. On Krea 2 the RMSNorm and SwiGLU of the text-fusion stack are not odd functions, so a negated tap stack is simply a *different prompt*, not an inverted one; and RMSNorm being scale-invariant, a *scaled* one is barely scaled at all. So a claimed weight is taken away from the emphasis pass — which sees a flat `1.0` for those segments — and travels alongside the conditioning as two per-token rows: a **value factor** and a **logit bias**.
 
-The ComfyUI node smuggles the same information through a sidecar token appended to the
-conditioning tensor, with magic constants and a checksum, because ComfyUI's graph gives it
-no other channel. Forge does have one: extra `model_conds` entries ride through
-`reconstruct_cond_batch` → `compile_conditions` → `apply_model` and land as keyword
-arguments on the diffusion model, batched and repeated in lockstep with the conditioning
-they describe. So the sidecar is gone, and with it every way it could be mangled — and
-because each row travels *with* its own conditioning, the positive and negative prompts
-cannot read each other's, which is what lets weights work in both at any CFG.
+The ComfyUI node smuggles the same information through a sidecar token appended to the conditioning tensor, with magic constants and a checksum, because ComfyUI's graph gives it no other channel. Forge does have one: extra `model_conds` entries ride through `reconstruct_cond_batch` → `compile_conditions` → `apply_model` and land as keyword arguments on the diffusion model, batched and repeated in lockstep with the conditioning they describe. So the sidecar is gone, and with it every way it could be mangled — and because each row travels *with* its own conditioning, the positive and negative prompts cannot read each other's, which is what lets weights work in both at any CFG.
 
-**Act inside attention.** Both rows are applied in the DiT, after text fusion has run, over
-the leading `txtlen` positions — exactly the text half of the concatenated sequence.
+**Act inside attention.** Both rows are applied in the DiT, after text fusion has run, over the leading `txtlen` positions — exactly the text half of the concatenated sequence.
 
-The value factor scales the output of each selected block's `wv`: attention still scores the
-token normally, then subtracts or damps what it contributes instead of adding it. The logit
-bias is added to the token's attention score, multiplying its softmax weight by `exp(bias)`
-for every query in the sequence — scaling a value vector cannot make the rest of the image
-attend to a word *more*, so amplification needs the other side of the softmax.
+The value factor scales the output of each selected block's `wv`: attention still scores the token normally, then subtracts or damps what it contributes instead of adding it. The logit bias is added to the token's attention score, multiplying its softmax weight by `exp(bias)` for every query in the sequence — scaling a value vector cannot make the rest of the image attend to a word *more*, so amplification needs the other side of the softmax.
 
-Two hooks do it: the attention module's `forward` parks the value factors for the duration
-of one call and substitutes the bias for the `mask` argument (Krea 2 never passes one — the
-DiT hands `None` to every block), and its `wv` linear scales the rows it names. Nothing of
-Forge's own attention math is copied, so an upstream change to Krea 2's attention does not
-silently break either lever. The bias does need a backend that accepts an additive mask, so
-`krea.attention_function` is pointed at the plain SDPA path while one is in play, and put
-back afterwards.
+Two hooks do it: the attention module's `forward` parks the value factors for the duration of one call and substitutes the bias for the `mask` argument (Krea 2 never passes one — the DiT hands `None` to every block), and its `wv` linear scales the rows it names. Nothing of Forge's own attention math is copied, so an upstream change to Krea 2's attention does not silently break either lever. The bias does need a backend that accepts an additive mask, so `krea.attention_function` is pointed at the plain SDPA path while one is in play, and put back afterwards.
 
-`txtfusion.layerwise_blocks` are deliberately left alone: they run at
-`(batch * seq, taps, dim)`, so their sequence axis is the 12-layer tap stack, and the rows
-do not index it.
+`txtfusion.layerwise_blocks` are deliberately left alone: they run at `(batch * seq, taps, dim)`, so their sequence axis is the 12-layer tap stack, and the rows do not index it.
+
+## Why the flip is about the prompt mean and not about zero
+
+`v -> -v` is the whole of NegPiP everywhere else, and it carries a term that has nothing to do with the word being flipped.
+
+Attention output is a *convex* combination of value vectors, `sum_j a_j v_j` with the `a` summing to one, and the text tokens' values share a large common component — write `v = vbar + d`. Scaling one token by `m` perturbs every query's output by `a_t (m-1) v_t`, which at `m = -1` is `-2 a_t (vbar + d)`. The `d` part is the word. The `vbar` part is not: it is the same vector subtracted from every query in the sequence, so it lands in the residual stream as a shared offset, and the next block's `RMSNorm` divides by a norm that offset has grown — shrinking the token-to-token variation around it, which is spatial detail. It happens at all 28 blocks, and, this being single-stream, to the text tokens as well as the image patches, so the prompt's own representation carries it forward too.
+
+`_apply_value_flip` therefore scales about `vbar` instead: `v -> vbar + m (v - vbar)`, so the perturbation is `a_t (m-1) d` and its shared component is exactly zero. `vbar` is the mean over the tokens the row leaves alone, recomputed per block from that block's own `wv` output. The suppression is untouched — `d` is inverted just as hard. The slider interpolates between the two, `0.0` being the original behaviour.
+
+Cross-attention models are not exposed to this the same way: there the flip lands in a side branch whose only queries are image patches, and the original NegPiP appends a *separately encoded* copy of the fragment rather than negating a token already in the sequence.
+
+**On magnitude.** The `-2 vbar` term is exact and easy to confirm in isolation — feed `_apply_value_flip` synthetic anisotropic values and the shared component of the change is `-1.997` at `reference = 0.0` and `+0.002` at `1.0`. What it is worth in a finished image took a while to pin down, because it is second-order and the split-encode dilution above swamps it: compared with single-pass off, where everything above a fifth of Nyquist sits at 24-35% of a no-weight baseline, the two references are indistinguishable. With single-pass on and the dominant term gone, one seed separates them cleanly — `reference = 0.0` leaves a hole across six consecutive mid bands, 0.35-0.74 of baseline against 0.82-0.94 at `1.0`, and mean gradient at 80% of baseline against 96%. The shape fits the mechanism: a shared offset compresses variation in the residual stream, which is broad regional contrast, so the *mid* bands go while fine texture injected late survives (0.87-0.97 at the top). That is a different signature from the dilution damage, which is worst at the top. One seed, so treat the size as provisional; the sign and the shape are not in doubt.
 
 ## Getting the weights onto the right tokens
 
-**`compile_conditions` learns a third shape.** It knows a bare tensor, or a dict with both
-`crossattn` and a pooled `vector`. NegPiP conditioning is `crossattn` plus the rows and no
-pooled vector, which would have raised `KeyError: 'vector'`. The rows are registered as
-plain `Condition`s rather than `ConditionCrossAttn`, so mismatched lengths refuse to batch
-instead of being repeated to a common length — a repeated row would describe the wrong
-tokens. The wrapper is installed on demand, is a straight pass-through for every other
-shape, and is never removed — Forge caches compiled conditioning on the
-`StableDiffusionProcessing` *class*, so a cond can outlive the run that made it.
+**`compile_conditions` learns a third shape.** It knows a bare tensor, or a dict with both `crossattn` and a pooled `vector`. NegPiP conditioning is `crossattn` plus the rows and no pooled vector, which would have raised `KeyError: 'vector'`. The rows are registered as plain `Condition`s rather than `ConditionCrossAttn`, so mismatched lengths refuse to batch instead of being repeated to a common length — a repeated row would describe the wrong tokens. The wrapper is installed on demand, is a straight pass-through for every other shape, and is never removed — Forge caches compiled conditioning on the `StableDiffusionProcessing` *class*, so a cond can outlive the run that made it.
 
-**The rows cover the words, not the boilerplate.** `Qwen3VLTextProcessingEngine.tokenize`
-wraps *every* weighted segment in the full chat template, so a prompt carrying weights
-tokenises to several copies of the template with the fragments spliced between them.
-Emphasis scales all of it, which is Forge's own behaviour and is what an unclaimed weight
-still gets — but flipping the sign of the system instruction is not what `(word:-1.0)`
-asks for. Both rows are confined to the fragment itself, located structurally inside each
-templated segment rather than at an assumed offset.
+**The rows cover the words, not the boilerplate.** `Qwen3VLTextProcessingEngine.tokenize` wraps *every* weighted segment in the full chat template, so a prompt carrying weights tokenises to several copies of the template with the fragments spliced between them. Emphasis scales all of it, which is Forge's own behaviour and is what an unclaimed weight still gets — but flipping the sign of the system instruction is not what `(word:-1.0)` asks for. Both rows are confined to the fragment itself, located structurally inside each templated segment rather than at an assumed offset.
 
-**Or the extra templates never happen at all.** *Encode the prompt in one pass* rejoins
-the parser's segments and encodes that once, locating each fragment by the character
-offsets a fast tokenizer reports and assigning every token to whichever segment covers
-most of its characters — so a BPE merge across a segment seam lands in exactly one of
-them. The token stream still comes from `engine.tokenize`; the offsets only have to agree
-with it, and are checked against it before being used. There is deliberately no second
-localisation heuristic: when offsets are unavailable or disagree, it falls back to the
-per-segment path above, which is a real tested encoder rather than a guess at where a
-fragment landed.
+How much boilerplate that is, is easy to underestimate. `strip_template` counts `<|im_start|>` occurrences and stops after two, so it removes the system instruction from the *first* segment only; every later segment keeps its copy of `<|im_start|>system\nDescribe the image by detailing the color, shape, ...:<|im_end|>` intact inside the conditioning. `a portrait of a woman posing on a beach. high quality analog photo, highly detailed.\n(watermark:-1)\n` parses to three segments and encodes as 734 characters against the unweighted prompt's 307, most of the addition being that instruction twice more. The words that were doing the work end up with roughly a quarter of the attention mass they had — which is where the softening people notice actually comes from, ahead of the value flip by a wide margin. It is Forge's own behaviour for any weighted Krea 2 prompt, extension or no extension, which is why *Encode the prompt in one pass* now defaults on.
 
-This is what makes the conditioning for `a portrait (blurry:-1.0) sharp` byte-identical to
-`a portrait blurry sharp` — and it only holds because a claimed weight already leaves a
-flat `1.0` behind in the emphasis multipliers.
+Measured on Krea 2's own tokenizer, `a portrait of a woman posing on a beach. high quality analog photo, highly detailed.` plus `(watermark:-1)` encodes to 103 conditioning tokens against the unweighted prompt's 23 — 80 of them two verbatim copies of the system instruction — and one-pass brings that to 25. The images agree: against a no-weight baseline at a fixed seed, the split encoding keeps 24-35% of the power above a fifth of Nyquist, and one-pass keeps 89-101%. Mean gradient goes 68% -> 96% of baseline, Laplacian RMS 58% -> 96%. Whatever else a negative weight does to an image, this was nearly all of the softening.
+
+**Or the extra templates never happen at all.** *Encode the prompt in one pass* rejoins the parser's segments and encodes that once, locating each fragment by character offset and assigning every token to whichever segment covers most of its characters — so a BPE merge across a segment seam lands in exactly one of them. The token stream still comes from `engine.tokenize`; the offsets only have to agree with it, and are checked against it before being used.
+
+**Where the offsets come from matters more than it looks.** The obvious source is the tokenizer, and an HF *fast* tokenizer reports them directly — but Krea 2 does not have one. The checkpoint ships `vocab.json` and `merges.txt` with no `tokenizer.json`, `model_index.json` names `Qwen2Tokenizer`, and `backend/loader.py` instantiates that class by name, so on the `transformers==4.57.6` Forge Neo pins it is the slow pure-Python tokenizer, which raises `NotImplementedError` on `return_offsets_mapping`. For as long as that was the only source, single-pass encoding stood down on *every* Krea 2 prompt — while `Krea2 NegPiP single pass: True` went on appearing in the infotext, so toggling it produced bit-identical images and read as "this option does nothing". Exactly the silent stand-down this port already lost time to once. `_decoded_offsets` is the second source: the span of token `i` is what decoding one more token adds to the decoded prefix. That is not a guess about where a fragment landed — the whole result is discarded unless decoding the full stream reproduces the templated prompt character for character, and it reproduces a fast tokenizer's own offsets exactly on Latin, accented, CJK, emoji and Cyrillic prompts. Only if both sources fail does it fall back to the per-segment path, and it now says so in the log when it does.
+
+This is what makes the conditioning for `a portrait (blurry:-1.0) sharp` byte-identical to `a portrait blurry sharp` — and it only holds because a claimed weight already leaves a flat `1.0` behind in the emphasis multipliers.
 
 ## Model detection
 
-`is_krea2_dit` duck-types on the identifying constants (`txtlayers`, `txtdim`) and on the
-attributes the hooks actually wrap (`blocks`, `txtfusion.refiner_blocks`, `txtmlp`) — and
-on nothing else. Every attribute in that check is a thing the framework may move, so one
-that is not load-bearing is pure liability. This is not hypothetical: an earlier version
-also tested for `SingleStreamDiT._unpack_context`, purely because it looked distinctive.
-Forge moved that method into the text encoder, detection failed, and the extension stood
-down **silently** — no error, no log line, the UI intact, and images pixel-identical to
-having it switched off. Standing down is indistinguishable from a prompt with no weights
-in it, which makes it this extension's worst failure mode by a distance.
+`is_krea2_dit` duck-types on the identifying constants (`txtlayers`, `txtdim`) and on the attributes the hooks actually wrap (`blocks`, `txtfusion.refiner_blocks`, `txtmlp`) — and on nothing else. Every attribute in that check is a thing the framework may move, so one that is not load-bearing is pure liability. This is not hypothetical: an earlier version also tested for `SingleStreamDiT._unpack_context`, purely because it looked distinctive. Forge moved that method into the text encoder, detection failed, and the extension stood down **silently** — no error, no log line, the UI intact, and images pixel-identical to having it switched off. Standing down is indistinguishable from a prompt with no weights in it, which makes it this extension's worst failure mode by a distance.
 
 ## Testing
 
-Everything is verified offline against Forge Neo's real sources, with no GPU, no checkpoint
-and no running webui. Five tiers:
+Everything is verified offline against Forge Neo's real sources, with no GPU, no checkpoint and no running webui. Five tiers:
 
 1. **Config** — the weight → lever mapping in isolation.
-2. **Text** — a fake tokenizer behind the *real* `Qwen3VLTextProcessingEngine`, so
-   `tokenize_line`, `strip_template` and the emphasis classes are Forge's own code.
-3. **Model** — a real (not mocked) tiny `nn.Module` shaped like `SingleStreamDiT`, asserting
-   byte-level that exactly the intended rows of `wv` change and by exactly the expected
-   factor, and that unpatching is a true inverse down to the instance dictionary.
-4. **Pipeline** — the real `prompt_parser` and `backend/sampling/condition.py` functions
-   chained end to end, proving cond and uncond stay row-aligned once Forge's batching code
-   has had them.
-5. **Contract** — reads Forge's actual source files and asserts every precondition the port
-   rests on: the attributes detection reads, the module names the hooks wrap, the forward
-   signatures, the argument assumed to always be `None`, the tensor rank the conditioning
-   arrives in, the template token ids. Tiers 1–4 test the extension against a *model* of the
-   framework, and that model moves with our assumptions rather than Forge's — this is the
-   only tier that fails when Forge changes rather than when we do.
+2. **Text** — a fake tokenizer behind the *real* `Qwen3VLTextProcessingEngine`, so `tokenize_line`, `strip_template` and the emphasis classes are Forge's own code.
+3. **Model** — a real (not mocked) tiny `nn.Module` shaped like `SingleStreamDiT`, asserting byte-level that exactly the intended rows of `wv` change and by exactly the expected factor, and that unpatching is a true inverse down to the instance dictionary.
+4. **Pipeline** — the real `prompt_parser` and `backend/sampling/condition.py` functions chained end to end, proving cond and uncond stay row-aligned once Forge's batching code has had them.
+5. **Contract** — reads Forge's actual source files and asserts every precondition the port rests on: the attributes detection reads, the module names the hooks wrap, the forward signatures, the argument assumed to always be `None`, the tensor rank the conditioning arrives in, the template token ids. Tiers 1–4 test the extension against a *model* of the framework, and that model moves with our assumptions rather than Forge's — this is the only tier that fails when Forge changes rather than when we do.

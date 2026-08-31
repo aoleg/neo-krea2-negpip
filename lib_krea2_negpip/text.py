@@ -169,29 +169,10 @@ def _token_owners(offsets: list[tuple[int, int]], bounds: list[tuple[int, int]])
     return owners
 
 
-def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[str, float]], config: WeightConfig):
-    """The weighted prompt as **one** templated encode, or `None` if that isn't possible.
-
-    `parse_prompt_attention` splits the prompt before the encoder ever sees it, and the
-    engine then wraps each piece in the full chat template.  Rejoining the pieces and
-    encoding once gives conditioning identical to the same prompt written without any
-    weights at all — the weights stop perturbing what the model reads and only drive the
-    attention levers, which is what they were supposed to do.
-
-    Localisation is by character offsets, which every HF *fast* tokenizer reports.  There
-    is deliberately no second heuristic behind that: if offsets are unavailable, or the
-    ids disagree with `engine.tokenize`, the caller falls back to `_tokenize_segmented`,
-    which is a real tested encoder rather than a guess at where a fragment landed.
-    """
-    clean = "".join(text for text, _ in parsed)
-    stripped = clean.strip()
-    lead = len(clean) - len(clean.lstrip())
-
-    prefix, _, _ = engine.llama_template.partition("{}")
-    tokens = engine.tokenize([clean])[0]
-
+def _reported_offsets(engine: "Qwen3VLTextProcessingEngine", templated: str, tokens: list) -> list[tuple[int, int]] | None:
+    """Character spans straight from the tokenizer, for the fast ones that report them."""
     try:
-        encoded = engine.tokenizer([engine.llama_template.format(stripped)], return_offsets_mapping=True)
+        encoded = engine.tokenizer([templated], return_offsets_mapping=True)
     except (NotImplementedError, TypeError, ValueError):
         return None
 
@@ -204,6 +185,80 @@ def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[s
         if [int(token) for token in encoded["input_ids"][0]] != [int(token) for token in tokens]:
             return None
     except (TypeError, ValueError):
+        return None
+
+    return [tuple(span) for span in offsets[0]]
+
+
+def _decoded_offsets(tokenizer, tokens: list, templated: str) -> list[tuple[int, int]] | None:
+    """Character spans worked out by decoding, for a tokenizer that cannot report them.
+
+    Krea 2 needs this, and needs it on the default install.  The checkpoint ships
+    `vocab.json` and `merges.txt` with no `tokenizer.json`, its `model_index.json` names
+    `Qwen2Tokenizer`, and `backend/loader.py` instantiates that class by name — so on the
+    `transformers` Forge Neo pins it is the *slow*, pure-Python tokenizer, which raises
+    `NotImplementedError` on `return_offsets_mapping`.  With only the reported-offset path,
+    single-pass encoding stood down on every Krea 2 prompt while still reporting itself as
+    enabled in the infotext.
+
+    Not a second guess at where a fragment landed: token `i` spans exactly what decoding
+    one more token adds to the decoded prefix, and the whole result is thrown away unless
+    decoding the full stream reproduces the templated prompt character for character.
+    """
+    ids: list[int] = []
+    for token in tokens:
+        value = _as_token_id(token)
+        if value is None:
+            return None  # an embedding occupies no characters of the prompt
+        ids.append(value)
+
+    def decode(seq: list[int]) -> str:
+        return tokenizer.decode(seq, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
+    try:
+        if decode(ids) != templated:
+            return None
+
+        offsets: list[tuple[int, int]] = []
+        cursor = 0
+        for i in range(len(ids)):
+            end = max(cursor, len(decode(ids[: i + 1])))
+            offsets.append((cursor, end))
+            cursor = end
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+
+    return offsets if cursor == len(templated) else None
+
+
+def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[str, float]], config: WeightConfig):
+    """The weighted prompt as **one** templated encode, or `None` if that isn't possible.
+
+    `parse_prompt_attention` splits the prompt before the encoder ever sees it, and the
+    engine then wraps each piece in the full chat template.  Rejoining the pieces and
+    encoding once gives conditioning identical to the same prompt written without any
+    weights at all — the weights stop perturbing what the model reads and only drive the
+    attention levers, which is what they were supposed to do.
+
+    Localisation is by character offsets: reported by the tokenizer where it can
+    (`_reported_offsets`), decoded back out of the token stream where it cannot
+    (`_decoded_offsets`), which on Forge Neo's pinned `transformers` is the Krea 2 case
+    and therefore the one that matters.  Both are checked against `engine.tokenize` before
+    they are used, and if neither can produce spans the caller falls back to
+    `_tokenize_segmented` — a real tested encoder rather than a guess.
+    """
+    clean = "".join(text for text, _ in parsed)
+    stripped = clean.strip()
+    lead = len(clean) - len(clean.lstrip())
+
+    prefix, _, _ = engine.llama_template.partition("{}")
+    tokens = engine.tokenize([clean])[0]
+    templated = engine.llama_template.format(stripped)
+
+    offsets = _reported_offsets(engine, templated, tokens)
+    if offsets is None:
+        offsets = _decoded_offsets(engine.tokenizer, tokens, templated)
+    if offsets is None or len(offsets) != len(tokens):
         return None
 
     bounds: list[tuple[int, int]] = []
@@ -220,7 +275,7 @@ def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[s
     factors = [1.0] * len(tokens)
     biases = [0.0] * len(tokens)
 
-    for i, owner in enumerate(_token_owners(list(offsets[0]), bounds)):
+    for i, owner in enumerate(_token_owners(offsets, bounds)):
         if owner is None:
             continue
         multipliers[i], factors[i], biases[i] = levers[owner]
@@ -230,12 +285,20 @@ def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[s
 
 def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
     """One prompt line -> the token stream plus the three rows indexed by it."""
+    global _warned_single_pass
+
     parsed = weighted_segments(line, engine.emphasis.name)
 
     if config.single_pass:
         single = _tokenize_single(engine, parsed, config)
         if single is not None:
             return single
+
+        #   the infotext records the option, not whether it engaged, so an unannounced
+        #   fallback here reads afterwards as "one pass was on and made no difference"
+        if not _warned_single_pass:
+            _warned_single_pass = True
+            logger.warning("NegPiP: cannot locate the prompt fragments in the token stream; falling back to the split encoding for this prompt")
 
     return _tokenize_segmented(engine, parsed, config)
 
@@ -318,6 +381,7 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
 
 _warned_reference = False
 _warned_expanded = False
+_warned_single_pass = False
 
 
 def _reference_active(model: "Krea2", prompt) -> bool:

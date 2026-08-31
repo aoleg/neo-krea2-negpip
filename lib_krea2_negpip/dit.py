@@ -6,7 +6,9 @@ already run:
 
 * the **value factor** scales the flagged tokens' value vectors — attention still scores
   them normally, then subtracts (or damps) what they contribute instead of adding it.
-  This is NegPiP proper.
+  This is NegPiP proper.  It scales about the prompt's own *mean* value vector rather
+  than about the origin, which leaves the common component of the text values alone; see
+  `_apply_value_flip` for why scaling about the origin softens the whole image.
 * the **logit bias** is added to the flagged tokens' attention scores, multiplying their
   softmax weight by `exp(bias)`.  Scaling a value vector cannot make the rest of the
   sequence attend to a token *more* — past a point it just saturates — so amplification
@@ -64,6 +66,7 @@ from lib_krea2_negpip import (
 )
 
 ACTIVE_ATTR = "_krea2_negpip_active_mask"
+REFERENCE_ATTR = "_krea2_negpip_mean_reference"
 ORIGINAL_FORWARD = "_krea2_negpip_original_forward"
 ORIGINAL_WV = "_krea2_negpip_original_wv_forward"
 ORIGINAL_ATTENTION = "_krea2_negpip_original_attention_function"
@@ -134,7 +137,43 @@ def _align_batch(row: torch.Tensor, batch: int) -> torch.Tensor | None:
     return row.repeat(batch // row.shape[0], *([1] * (row.ndim - 1)))
 
 
-def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _mean_value(text: torch.Tensor, m: torch.Tensor, amount: float) -> torch.Tensor:
+    """`amount` x the mean value vector of the text tokens this row leaves alone.
+
+    Averaged over the *unflagged* tokens, so a flagged one cannot drag its own reference
+    towards itself.  A prompt where every token is flagged has no such mean, and falls
+    back to the whole row rather than dividing by zero.
+    """
+    keep = (m == 1.0).to(torch.float32)
+    denom = keep.sum(dim=1, keepdim=True)
+
+    empty = denom == 0
+    if bool(empty.any()):
+        keep = torch.where(empty, torch.ones_like(keep), keep)
+        denom = keep.sum(dim=1, keepdim=True)
+
+    mean = (text.to(torch.float32) * keep).sum(dim=1, keepdim=True) / denom
+    return (mean * amount).to(text.dtype)
+
+
+def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.0) -> torch.Tensor:
+    """Scale the flagged tokens' value vectors, about `reference` x the prompt's mean.
+
+    `reference = 0.0` is NegPiP as written — `v -> m*v`, a reflection about the origin.
+    That reflection is not sign-symmetric in a way the model is: attention output is a
+    *convex* combination of value vectors, and the text tokens' values share a large
+    common component, so `m = -1` subtracts `2*a_t` of that common component from every
+    query in the sequence — the image patches and, this being a single-stream DiT, the
+    text tokens as well, at each of the 28 blocks.  A shared offset on every token is
+    exactly what the next block's `RMSNorm` divides out at the expense of the token-to-
+    token variation around it, which is spatial detail.
+
+    `reference = 1.0` reflects about the prompt's own mean value vector instead:
+    `v -> vbar + m*(v - vbar)`.  Writing `v = vbar + d`, the perturbation is then
+    `(m-1)*d` rather than `(m-1)*(vbar + d)` — the shared component of the change is
+    exactly zero, and only the part that says *which word this is* gets inverted.  The
+    suppression is unchanged; what stops happening is the broadband softening.
+    """
     if not torch.is_tensor(v) or v.ndim != 3:
         return v
 
@@ -146,7 +185,13 @@ def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if m is None:
         return v
 
-    v[:, :length, :] = v[:, :length, :] * m
+    if reference > 0.0:
+        #   v' = r + m*(v - r) = m*v + r*(1 - m); `r` has to be read before the write
+        r = _mean_value(v[:, :length, :], m, reference)
+        v[:, :length, :] = v[:, :length, :] * m + r * (1.0 - m)
+    else:
+        v[:, :length, :] = v[:, :length, :] * m
+
     return v
 
 
@@ -212,7 +257,7 @@ def _hook_wv(attn: Any, remove: bool):
         mask = getattr(attn, ACTIVE_ATTR, None)
         if mask is None:
             return out
-        return _apply_value_flip(out, mask)
+        return _apply_value_flip(out, mask, getattr(attn, REFERENCE_ATTR, 0.0))
 
     negpip_forward._negpip = True
 
@@ -220,7 +265,7 @@ def _hook_wv(attn: Any, remove: bool):
     wv.forward = negpip_forward
 
 
-def _hook_attention(attn: Any, role: str = "", remove: bool = False):
+def _hook_attention(attn: Any, role: str = "", mean_reference: float = 0.0, remove: bool = False):
     if remove:
         original = getattr(attn, ORIGINAL_FORWARD, None)
         if original is not None:
@@ -230,10 +275,14 @@ def _hook_attention(attn: Any, role: str = "", remove: bool = False):
 
         _hook_wv(attn, True)
 
-        for name in (NEGPIP_ROLE_ATTR, ACTIVE_ATTR):
+        for name in (NEGPIP_ROLE_ATTR, ACTIVE_ATTR, REFERENCE_ATTR):
             if hasattr(attn, name):
                 delattr(attn, name)
         return
+
+    #   before the already-hooked check: the slider may have moved without anything else
+    #   about the patch changing, and a stale reference is a silently wrong image
+    setattr(attn, REFERENCE_ATTR, float(mean_reference))
 
     if getattr(attn, ORIGINAL_FORWARD, None) is not None:
         return
@@ -382,7 +431,7 @@ def _force_pytorch_attention(enable: bool):
 # ================================================================================ #
 
 
-def patch_dit(dit: Any, *, block_start: int, block_end: int, block_stride: int, patch_txtfusion_refiners: bool, force_pytorch_attention: bool = False) -> int:
+def patch_dit(dit: Any, *, block_start: int, block_end: int, block_stride: int, patch_txtfusion_refiners: bool, mean_reference: float = 1.0, force_pytorch_attention: bool = False) -> int:
     """Hook the DiT forward and the value projection of every selected attention module.
 
     Returns how many attention modules were hooked.
@@ -397,7 +446,7 @@ def patch_dit(dit: Any, *, block_start: int, block_end: int, block_stride: int, 
     for i in selected_blocks(len(blocks), block_start, block_end, block_stride):
         attn = getattr(blocks[i], "attn", None)
         if attn is not None:
-            _hook_attention(attn, ROLE_BLOCK)
+            _hook_attention(attn, ROLE_BLOCK, mean_reference)
             hooked += 1
 
     if patch_txtfusion_refiners:
@@ -405,7 +454,7 @@ def patch_dit(dit: Any, *, block_start: int, block_end: int, block_stride: int, 
         for block in getattr(txtfusion, "refiner_blocks", []) or []:
             attn = getattr(block, "attn", None)
             if attn is not None:
-                _hook_attention(attn, ROLE_REFINER)
+                _hook_attention(attn, ROLE_REFINER, mean_reference)
                 hooked += 1
 
     return hooked

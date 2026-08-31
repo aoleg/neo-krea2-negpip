@@ -80,6 +80,15 @@ class Krea2NegPiP(scripts.Script):
                 info="how far the weight is taken; 1.0 makes (word:-1.0) a plain sign flip, 0.0 is off",
             )
 
+            mean_reference = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=1.0,
+                step=0.05,
+                label="Reference the prompt mean",
+                info="flip the word against the average of the other text tokens rather than against zero; 0.0 is NegPiP as originally written, which also subtracts a slice of the conditioning itself and softens the whole image",
+            )
+
             handle_deemphasis = gr.Checkbox(
                 False,
                 label="Handle de-emphasis too",
@@ -102,9 +111,9 @@ class Krea2NegPiP(scripts.Script):
             )
 
             single_pass = gr.Checkbox(
-                False,
+                True,
                 label="Encode the prompt in one pass",
-                info="a weighted prompt is otherwise encoded once per weighted segment, each in its own copy of the chat template; this rejoins them so the weights change nothing but the attention levers",
+                info="a weighted prompt is otherwise encoded once per weighted segment, each in its own copy of the chat template — which buries the prompt in repeated boilerplate and is the single largest cause of quality loss from a weighted prompt; this rejoins them so the weights change nothing but the attention levers",
             )
 
             with gr.Accordion("Advanced", open=False):
@@ -123,6 +132,7 @@ class Krea2NegPiP(scripts.Script):
         self.infotext_fields = [
             (enable, lambda d: "Krea2 NegPiP value strength" in d),
             (value_strength, "Krea2 NegPiP value strength"),
+            (mean_reference, "Krea2 NegPiP mean reference"),
             (handle_deemphasis, "Krea2 NegPiP de-emphasis"),
             (handle_emphasis, "Krea2 NegPiP emphasis"),
             (emphasis_gain, "Krea2 NegPiP emphasis gain"),
@@ -133,7 +143,7 @@ class Krea2NegPiP(scripts.Script):
             (block_stride, "Krea2 NegPiP block stride"),
         ]
 
-        return [enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride]
+        return [enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride]
 
     # ============================================================================ #
 
@@ -163,7 +173,7 @@ class Krea2NegPiP(scripts.Script):
         cls.warned_emphasis = True
         logger.warning('NegPiP needs prompt emphasis parsing; Emphasis is set to "None", so negative weights are read as literal text')
 
-    def _resolve(self, p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride):
+    def _resolve(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride):
         """UI arguments + this batch's prompts -> what to patch, or `None` to stand down."""
         if not enable:
             return None
@@ -210,6 +220,7 @@ class Krea2NegPiP(scripts.Script):
             "block_end": int(block_end),
             "block_stride": int(block_stride),
             "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
+            "mean_reference": min(1.0, max(0.0, float(mean_reference))),
             "force_pytorch_attention": active.uses_bias,
         }
 
@@ -217,10 +228,10 @@ class Krea2NegPiP(scripts.Script):
 
         return model, dit, config, active, options, signature
 
-    def process_batch(self, p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
+    def process_batch(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
         cls = Krea2NegPiP
 
-        resolved = self._resolve(p, enable, value_strength, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride)
+        resolved = self._resolve(p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride)
 
         if resolved is None:
             cls._teardown()
@@ -233,14 +244,19 @@ class Krea2NegPiP(scripts.Script):
         #   is what this batch's prompts actually need patching for
         model, dit, config, active, options, signature = resolved
 
-        params = {"Krea2 NegPiP value strength": config.strength}
+        #   the two quality-critical ones are recorded unconditionally, default or not:
+        #   both changed default at the same time as the softening was tracked down, and
+        #   an image whose infotext omits them is an image nobody can place afterwards
+        params = {
+            "Krea2 NegPiP value strength": config.strength,
+            "Krea2 NegPiP mean reference": options["mean_reference"],
+            "Krea2 NegPiP single pass": config.single_pass,
+        }
         if config.deemphasis:
             params["Krea2 NegPiP de-emphasis"] = True
         if config.emphasis:
             params["Krea2 NegPiP emphasis"] = True
             params["Krea2 NegPiP emphasis gain"] = config.gain
-        if config.single_pass:
-            params["Krea2 NegPiP single pass"] = True
         if options["patch_txtfusion_refiners"]:
             params["Krea2 NegPiP refiners"] = True
         if options["block_start"] != 0:
