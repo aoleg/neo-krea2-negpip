@@ -52,29 +52,40 @@ Nothing happens unless a prompt actually contains a negative weight, so it is sa
 
 Everything below is one seed (42) on a Krea 2 int8 checkpoint with the Turbo LoRA at 0.6, Euler a, 12 steps, CFG 1, 1536×1536, Emphasis set to *No norm*. Nothing changes between the panels of a sheet except what the caption says.
 
+### Suppression
+
+```text
+a cute cat sitting on a sofa in a living room
+a cute cat sitting on a sofa in a living room (pillows:-1.0)
+```
+
+![the plain prompt, and the same prompt with (pillows:-1.0)](scr/suppression.webp)
+
+The prompt never asks for pillows; the model puts two on every sofa it draws anyway. That is exactly what a negative weight is for — something the model brings unbidden, which you cannot remove by leaving it out of the prompt because it was never in the prompt. `(pillows:-1.0)` takes them out and leaves the room a room: sofa, plant, cat, same framing. The cat changes breed and the lamp goes, and that is the honest cost — one word flipped, and the model resamples some of what sat near it. Pick a word for what you see, not for what you fear: `pillows` worked here because pillows were there.
+
 ### The two emphasis levers
 
 ```text
 a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
 ```
 
-![the same prompt with Forge's own emphasis, value emphasis, attention emphasis, and both](scr/emphasis-levers.webp)
+![no weight, Forge's own emphasis, value emphasis, attention emphasis](scr/emphasis-levers.webp)
 
-Same prompt four ways. Top left is the extension switched off — Forge's own emphasis, which scales the text embedding by 2. Top right is **Amplify emphasis in values**, bottom left **Handle emphasis in attention** at gain `2.0`, bottom right both at once.
+Top left is the prompt with no weight at all — `red theme, blue theme`. With one-pass encoding on, that is the exact conditioning the two lever runs start from, so the lever is the only thing that differs. Top right is the extension switched off: Forge's own emphasis, which scales the text embedding by 2. Bottom left is **Amplify emphasis in values**, bottom right **Handle emphasis in attention** at gain `2.0`.
 
-The attention lever is the strong one. It turns the room blue — curtains, sofa, walls — and pushes red out to one chair. The value lever at `2.0` is gentler than that, gentler than Forge's own emphasis on this seed even, and it rearranges the room as well, because claiming the weight changes what the model reads: the ×2 comes off the embedding and the prompt is encoded in one pass. For whoever wants a number, blue-dominant pixels: 24% off, 13% values, 57% attention, 68% both.
+Blue-dominant pixels: 8% with no weight, 24% Forge's own, 13% values, 57% attention. Both levers at once, not shown, reaches 68%. The attention lever is the strong one — it turns the room blue, curtains, sofa, walls, and pushes red out to one chair. The value lever at `2.0` moves the needle, but not far, and on this seed Forge's own emphasis moves it further. Do not expect the value lever to be a drop-in upgrade for `(word:2.0)`.
 
 Why the gap: gain `2.0` multiplies the word's share of attention by e² ≈ 7.4, while the value lever doubles a contribution that was small to begin with. Linear is honest, but linear from a small number is small. Expect to need `3.0` on the value lever where `2.0` does the job in attention.
 
 ### The value lever is linear
 
 ```text
-a cute cat sitting on a sofa in a living room, red theme, (blue theme:1.5)   /   2.0   /   3
+a cute cat sitting on a sofa in a living room, red theme, blue theme   /   (blue theme:1.5)   /   2.0   /   3
 ```
 
-![value emphasis at 1.5, 2.0 and 3](scr/value-emphasis-ladder.webp)
+![no weight, then value emphasis at 1.5, 2.0 and 3](scr/value-emphasis-ladder.webp)
 
-`1.5` and `2.0` look like siblings; `3` is where blue takes the curtains, the cushions and the throw. It is monotonic — 10%, 13%, 28% blue-dominant — but it is not fast. One check that costs nothing: `(blue theme:1.5)` at Value strength `1.0` and `(blue theme:2.0)` at Value strength `0.5` are the same factor, and the two images are pixel-identical. That is the formula doing exactly what the table below says.
+From the unweighted prompt on the left: `1.5` and `2.0` stay in the family — grey sofa, blue in the cushions, red in the throw — and `3` is where blue takes the curtains, the cushions and the throw. Monotonic, 8%, 10%, 13%, 28% blue-dominant, but not fast. One check that costs nothing: `(blue theme:1.5)` at Value strength `1.0` and `(blue theme:2.0)` at Value strength `0.5` are the same factor, and the two images are pixel-identical. That is the formula doing exactly what the table below says.
 
 ### Magnitude reaches the image
 
