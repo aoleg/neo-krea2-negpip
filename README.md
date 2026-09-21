@@ -48,6 +48,44 @@ NegPiP Enable (Positive: 3)
 
 Nothing happens unless a prompt actually contains a negative weight, so it is safe to leave switched on all the time.
 
+## What it looks like
+
+Everything below is one seed (42) on a Krea 2 int8 checkpoint with the Turbo LoRA at 0.6, Euler a, 12 steps, CFG 1, 1536×1536, Emphasis set to *No norm*. Nothing changes between the panels of a sheet except what the caption says.
+
+### The two emphasis levers
+
+```text
+a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
+```
+
+![the same prompt with Forge's own emphasis, value emphasis, attention emphasis, and both](scr/emphasis-levers.webp)
+
+Same prompt four ways. Top left is the extension switched off — Forge's own emphasis, which scales the text embedding by 2. Top right is **Amplify emphasis in values**, bottom left **Handle emphasis in attention** at gain `2.0`, bottom right both at once.
+
+The attention lever is the strong one. It turns the room blue — curtains, sofa, walls — and pushes red out to one chair. The value lever at `2.0` is gentler than that, gentler than Forge's own emphasis on this seed even, and it rearranges the room as well, because claiming the weight changes what the model reads: the ×2 comes off the embedding and the prompt is encoded in one pass. For whoever wants a number, blue-dominant pixels: 24% off, 13% values, 57% attention, 68% both.
+
+Why the gap: gain `2.0` multiplies the word's share of attention by e² ≈ 7.4, while the value lever doubles a contribution that was small to begin with. Linear is honest, but linear from a small number is small. Expect to need `3.0` on the value lever where `2.0` does the job in attention.
+
+### The value lever is linear
+
+```text
+a cute cat sitting on a sofa in a living room, red theme, (blue theme:1.5)   /   2.0   /   3
+```
+
+![value emphasis at 1.5, 2.0 and 3](scr/value-emphasis-ladder.webp)
+
+`1.5` and `2.0` look like siblings; `3` is where blue takes the curtains, the cushions and the throw. It is monotonic — 10%, 13%, 28% blue-dominant — but it is not fast. One check that costs nothing: `(blue theme:1.5)` at Value strength `1.0` and `(blue theme:2.0)` at Value strength `0.5` are the same factor, and the two images are pixel-identical. That is the formula doing exactly what the table below says.
+
+### Magnitude reaches the image
+
+```text
+a portrait photo of a woman in bikini on a beach, (watermark:-0.5)   /   -1   /   -2
+```
+
+![a negative weight at three magnitudes](scr/negative-magnitude.webp)
+
+There is no watermark in any of these to remove, which makes it a clean test of something else: whether the size of a negative weight matters on Krea 2, or only its sign. It matters. The face and the pose hold, and the background walks away with the weight — open sea at `-0.5`, rocks at `-1`, a city at `-2`. Two lessons in one sheet. The weight is a dial, not a switch. And a negative weight on a word the image never contained is not free: it still moves the image, just not where you were looking. Negate what is actually there.
+
 ## What the numbers mean
 
 With the default settings, the weight you type is the strength of the subtraction:
@@ -113,7 +151,7 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 **What it does:** takes over emphasis — weights above `1` — and applies it with the same lever a negative weight uses, continued upwards: `(word:2.0)` makes the word contribute twice as much to every part of the image that attends to it, `(word:-1.0)` makes it contribute the opposite, and `(word:1.0)` sits in between. **Value strength** scales this the same way it scales negative weights.
 
-**What you'll see:** emphasis that works, in the same currency as suppression. Compared with **Handle emphasis in attention** above, this one is linear — `3.0` really is three times `1.0` — and it does not saturate, so large weights keep growing rather than levelling off, and it costs nothing in speed on any attention backend. The other one changes how much of the image's attention the word *captures* from the rest of the prompt, which is a different effect; try both on a fixed seed and keep the one that reads as emphasis to you. Switching both on at once is allowed but doubles up.
+**What you'll see:** emphasis in the same currency as suppression, and gentler than the attention lever at the same number — see [the sheets above](#the-two-emphasis-levers). Compared with **Handle emphasis in attention**, this one is linear — `3.0` really is three times `1.0` — and it does not saturate, so large weights keep growing rather than levelling off, and it costs nothing in speed on any attention backend. Expect to reach for `3.0` where the other lever does it at `2.0`. The other one changes how much of the image's attention the word *captures* from the rest of the prompt, which is a different effect; try both on a fixed seed and keep the one that reads as emphasis to you. Switching both on at once is allowed but doubles up.
 
 **Off by default,** for the same reason as the setting above.
 
