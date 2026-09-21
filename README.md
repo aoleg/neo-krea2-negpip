@@ -59,8 +59,11 @@ With the default settings, the weight you type is the strength of the subtractio
 | `(word:-0.5)` | A gentle push away. Good when `-1.0` overcorrects into something else. |
 | `(word:0)` † | The word is simply deleted from the image, without pushing away from it. Useful for a word the sentence needs in order to read naturally, but which you do not want rendered. |
 | `(word:1.0)` | Normal. No effect. |
+| `(word:2.0)` ‡ | The word contributes twice as much. Continues the same scale upwards: `1.5` is half again, `3.0` three times. |
 
 † Weights from `0` up to `1` — including `(word:0)` itself — are only handled once **Handle de-emphasis too** is switched on. Left off, they fall through to Forge's ordinary de-emphasis, and a prompt containing nothing but those will not engage the extension at all.
+
+‡ Weights above `1` are only handled once **Amplify emphasis in values** (or **Handle emphasis in attention**) is switched on. Left off, they fall through to Forge's ordinary emphasis, which Krea 2 largely normalises away.
 
 Start at `-1.0`. If the thing is still there, go further negative; if the image starts looking distorted or fixated on the opposite, come back up.
 
@@ -106,6 +109,14 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 **What you'll see:** the effect grows very quickly — going from `2.0` to `4.0` is far more than twice as strong, and it compounds through the model. If an emphasised word starts dominating the image, smearing, or crowding out everything else in the prompt, lower this before lowering your prompt weights. `1.0` is a good starting point if `2.0` feels wild.
 
+### Amplify emphasis in values
+
+**What it does:** takes over emphasis — weights above `1` — and applies it with the same lever a negative weight uses, continued upwards: `(word:2.0)` makes the word contribute twice as much to every part of the image that attends to it, `(word:-1.0)` makes it contribute the opposite, and `(word:1.0)` sits in between. **Value strength** scales this the same way it scales negative weights.
+
+**What you'll see:** emphasis that works, in the same currency as suppression. Compared with **Handle emphasis in attention** above, this one is linear — `3.0` really is three times `1.0` — and it does not saturate, so large weights keep growing rather than levelling off, and it costs nothing in speed on any attention backend. The other one changes how much of the image's attention the word *captures* from the rest of the prompt, which is a different effect; try both on a fixed seed and keep the one that reads as emphasis to you. Switching both on at once is allowed but doubles up.
+
+**Off by default,** for the same reason as the setting above.
+
 ### Encode the prompt in one pass
 
 **What it does:** fixes something that happens to every weighted Krea 2 prompt, with or without this extension. Forge splits your prompt at each weight and sends the pieces to the text encoder separately — so `a portrait (blurry:-1.0) sharp` is read as three fragments rather than one sentence. This rejoins them, so the model reads exactly the prompt you would have written with no weights in it.
@@ -115,6 +126,8 @@ Worse than it sounds: each fragment gets its own copy of Krea 2's whole chat tem
 **What you'll see:** weighted prompts stop drifting away from their unweighted versions. If you have noticed that adding a weight to a prompt changes the image more than the weight itself should account for — different composition, a different mood, a general loss of contrast and fine detail, not just more or less of the weighted word — this is the largest single cause, and this is the fix. The weights then do nothing but the job you gave them.
 
 **On by default.** Switch it off to reproduce images made before that changed.
+
+If the tokenizer cannot say where each fragment landed, the extension tokenises the fragments separately and splices them into one copy of the template instead — the sentence is the same, only a token or two at each seam can differ from the unweighted prompt, and the console says so once. The old behaviour of falling back to the split encoding is gone; that encoding is now only used with this option off.
 
 > [!IMPORTANT]
 > If you used this option before and found it changed nothing, that was a bug, not a verdict. Krea 2's tokenizer cannot report the character offsets the option needed, so it stood down on every prompt while still recording itself as enabled — toggling it produced bit-identical images. It now works out the offsets itself, and logs a warning on the rare prompt where it still cannot. Any comparison you made before is void.
@@ -132,7 +145,7 @@ All settings are saved into the image's generation parameters and paste back fro
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
-- **Is the weight negative?** With the two opt-in settings off, only negative weights do anything. `(word:1.5)` alone will not trigger it.
+- **Is the weight negative?** With the three opt-in settings off, only negative weights do anything. `(word:1.5)` alone will not trigger it.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
 - **Is the checkpoint Krea 2?** It deliberately does nothing on other models.
 
@@ -160,6 +173,7 @@ See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the implementation: why the existing 
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip) — NegPiP itself.
 - [blue-pen5805](https://github.com/blue-pen5805/ComfyUI-krea2-negpip) — the Krea 2 ComfyUI node this is a port of.
 - [Haoming02](https://github.com/Haoming02/sd-webui-forge-classic) — Forge Neo, and the [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) port that mapped out how NegPiP fits into it.
+- [flyfront](https://github.com/flyfront/sd-forge-negpip) — the per-segment one-pass tokenizer this uses as a fallback, and the case for value-side emphasis.
 
 ## License
 

@@ -5,15 +5,18 @@ Two levers, both applied inside attention, after every non-linear conditioning s
 already run:
 
 * the **value factor** scales the flagged tokens' value vectors — attention still scores
-  them normally, then subtracts (or damps) what they contribute instead of adding it.
-  This is NegPiP proper.  It scales about the prompt's own *mean* value vector rather
-  than about the origin, which leaves the common component of the text values alone; see
-  `_apply_value_flip` for why scaling about the origin softens the whole image.
+  them normally, then subtracts (or damps, or amplifies) what they contribute instead of
+  adding it as-is.  This is NegPiP proper.  It scales about the prompt's own *mean* value
+  vector rather than about the origin, which leaves the common component of the text
+  values alone; see `_apply_value_flip` for why scaling about the origin softens the
+  whole image.  A token's share of the attention output is *linear* in this factor, so it
+  works above `1.0` as well and never saturates, and it needs no mask, so it runs on every
+  attention backend.
 * the **logit bias** is added to the flagged tokens' attention scores, multiplying their
-  softmax weight by `exp(bias)`.  Scaling a value vector cannot make the rest of the
-  sequence attend to a token *more* — past a point it just saturates — so amplification
-  needs the other side of the softmax.  A logit bias is also the only lever that survives
-  the `RMSNorm`s intact, being additive in a space nothing normalises.
+  softmax weight by `exp(bias)`.  It changes how much the sequence *attends* to the token
+  rather than what the token contributes, which is a different kind of emphasis: the other
+  keys lose the share the flagged one gains.  It saturates as that share approaches one,
+  and it needs an attention backend that accepts an additive mask.
 
 Krea 2 never passes an attention mask — `SingleStreamDiT.forward` hands `None` to every
 block and to `txtfusion` — so the bias rides the `mask` argument that is already threaded

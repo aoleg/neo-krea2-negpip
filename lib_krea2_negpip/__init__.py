@@ -65,11 +65,17 @@ class WeightConfig:
     exactly as it would without the extension installed.
 
     * `value_factor` scales the token's **value** vector.  Continuous: `1.0` is untouched,
-      `0.0` removes the token's contribution, negative subtracts it.  `1 + strength*(w-1)`
-      reproduces the old plain sign flip at the default `strength=1.0, w=-1.0`.
+      `0.0` removes the token's contribution, negative subtracts it, and above `1.0` it
+      amplifies.  `1 + strength*(w-1)` reproduces the old plain sign flip at the default
+      `strength=1.0, w=-1.0`, and makes `(word:2.0)` twice the contribution.  A token's
+      share of the attention output is *linear* in this factor, so it never saturates.
     * `logit_bias` adds a constant to the token's **attention logit**, which multiplies its
-      softmax weight by `exp(bias)`.  Immune to every norm in the path, so this is the one
-      that actually works for amplification.
+      softmax weight by `exp(bias)`.  Immune to every norm in the path, but it is a share of
+      a softmax, so it saturates as that share approaches one, and it needs an attention
+      backend that accepts an additive mask.
+
+    Either lever can take `w > 1`; `value_emphasis` and `emphasis` choose.  They are not
+    exclusive, but a comparison is only meaningful with one of them on.
     """
 
     strength: float = 1.0
@@ -78,6 +84,8 @@ class WeightConfig:
     emphasis: bool = False
     """claim `w > 1` and route it through `logit_bias` instead of Forge's emphasis"""
     gain: float = 2.0
+    value_emphasis: bool = False
+    """claim `w > 1` on the value lever: `1 + strength*(w-1)`, the negative side continued"""
     single_pass: bool = False
     """encode the prompt once instead of once per weighted segment; see `text.py`"""
 
@@ -90,12 +98,14 @@ class WeightConfig:
         return self.emphasis and self.gain > 0.0
 
     def value_factor(self, weight: float) -> float:
-        if weight >= 1.0 or not self.uses_value:
+        if weight == 1.0 or not self.uses_value:
             return 1.0
-        if weight >= 0.0 and not self.deemphasis:
+        if weight > 1.0 and not self.value_emphasis:
+            return 1.0
+        if 0.0 <= weight < 1.0 and not self.deemphasis:
             return 1.0
 
-        return min(1.0, max(-MAX_STRENGTH, 1.0 + self.strength * (weight - 1.0)))
+        return min(MAX_STRENGTH, max(-MAX_STRENGTH, 1.0 + self.strength * (weight - 1.0)))
 
     def logit_bias(self, weight: float) -> float:
         if weight <= 1.0 or not self.uses_bias:

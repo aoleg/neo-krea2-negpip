@@ -110,6 +110,12 @@ class Krea2NegPiP(scripts.Script):
                 info="attention weight is multiplied by exp(gain x (weight - 1)), so this compounds quickly over blocks",
             )
 
+            handle_value_emphasis = gr.Checkbox(
+                False,
+                label="Amplify emphasis in values",
+                info="make weights above 1 scale what the word contributes, the same lever a negative weight uses, continued upwards: (word:2.0) contributes twice; linear, never saturates, works on every attention backend; Value strength applies",
+            )
+
             single_pass = gr.Checkbox(
                 True,
                 label="Encode the prompt in one pass",
@@ -136,6 +142,7 @@ class Krea2NegPiP(scripts.Script):
             (handle_deemphasis, "Krea2 NegPiP de-emphasis"),
             (handle_emphasis, "Krea2 NegPiP emphasis"),
             (emphasis_gain, "Krea2 NegPiP emphasis gain"),
+            (handle_value_emphasis, "Krea2 NegPiP value emphasis"),
             (single_pass, "Krea2 NegPiP single pass"),
             (patch_txtfusion_refiners, "Krea2 NegPiP refiners"),
             (block_start, "Krea2 NegPiP first block"),
@@ -143,7 +150,7 @@ class Krea2NegPiP(scripts.Script):
             (block_stride, "Krea2 NegPiP block stride"),
         ]
 
-        return [enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride]
+        return [enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, handle_value_emphasis, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride]
 
     # ============================================================================ #
 
@@ -173,7 +180,7 @@ class Krea2NegPiP(scripts.Script):
         cls.warned_emphasis = True
         logger.warning('NegPiP needs prompt emphasis parsing; Emphasis is set to "None", so negative weights are read as literal text')
 
-    def _resolve(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride):
+    def _resolve(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, handle_value_emphasis, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride):
         """UI arguments + this batch's prompts -> what to patch, or `None` to stand down."""
         if not enable:
             return None
@@ -187,6 +194,7 @@ class Krea2NegPiP(scripts.Script):
             deemphasis=bool(handle_deemphasis),
             emphasis=bool(handle_emphasis),
             gain=min(MAX_GAIN, max(0.0, float(emphasis_gain))),
+            value_emphasis=bool(handle_value_emphasis),
             single_pass=bool(single_pass),
         )
 
@@ -228,10 +236,10 @@ class Krea2NegPiP(scripts.Script):
 
         return model, dit, config, active, options, signature
 
-    def process_batch(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
+    def process_batch(self, p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, handle_value_emphasis, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride, *args, **kwargs):
         cls = Krea2NegPiP
 
-        resolved = self._resolve(p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride)
+        resolved = self._resolve(p, enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, handle_value_emphasis, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride)
 
         if resolved is None:
             cls._teardown()
@@ -257,6 +265,8 @@ class Krea2NegPiP(scripts.Script):
         if config.emphasis:
             params["Krea2 NegPiP emphasis"] = True
             params["Krea2 NegPiP emphasis gain"] = config.gain
+        if config.value_emphasis:
+            params["Krea2 NegPiP value emphasis"] = True
         if options["patch_txtfusion_refiners"]:
             params["Krea2 NegPiP refiners"] = True
         if options["block_start"] != 0:

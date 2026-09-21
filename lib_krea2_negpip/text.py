@@ -28,8 +28,11 @@ segment (`_tokenize_segmented`), which means a weight changes what the model rea
 any lever is applied.  The other is to rejoin the segments and encode once
 (`_tokenize_single`), locating each fragment by character offset — the conditioning is
 then identical to the same prompt written with no weights at all, and the weights do
-nothing but drive the levers.  The second is opt-in, and falls back to the first whenever
-the tokenizer cannot report offsets.
+nothing but drive the levers.  When no offsets can be had, `_tokenize_joined` tokenises
+each segment on its own and splices the pieces into one copy of the template: not
+byte-identical to the unweighted prompt at the segment seams, but free of the repeated
+boilerplate, which is the damage that matters.  The split encode is only ever used when
+one-pass encoding is switched off.
 """
 
 from functools import wraps
@@ -283,9 +286,64 @@ def _tokenize_single(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[s
     return tokens, multipliers, factors, biases
 
 
+def _tokenize_joined(engine: "Qwen3VLTextProcessingEngine", parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]] | None:
+    """Each segment tokenised on its own, spliced into **one** copy of the chat template.
+
+    The fallback for `_tokenize_single` when neither offset source can place the
+    fragments (after flyfront/sd-forge-negpip).  Every segment's tokens are exactly the
+    segment's own, so the rows need no localisation at all — the stream is
+    `prefix + seg_1 + ... + seg_n + suffix` by construction.
+
+    What it gives up against `_tokenize_single` is byte-identity with the unweighted
+    prompt: a BPE merge that would have crossed a segment seam cannot happen, and a
+    segment's leading space is tokenised at the start of a string rather than mid-sentence.
+    A handful of tokens differ at each seam; the sentence is otherwise the sentence, and
+    the template appears once.  The split encode would repeat the system instruction per
+    segment, which is the damage that matters.
+
+    The outer ends are stripped because `tokenize` strips the whole prompt before
+    formatting it; interior whitespace belongs to whichever segment carries it.
+    """
+    prefix, placeholder, suffix = engine.llama_template.partition("{}")
+    if not placeholder:
+        return None
+
+    texts = [text for text, _ in parsed]
+    if texts:
+        texts[0] = texts[0].lstrip()
+        texts[-1] = texts[-1].rstrip()
+
+    try:
+        encoded = engine.tokenizer([prefix, *texts, suffix])["input_ids"]
+    except (TypeError, ValueError, KeyError):
+        return None
+    if len(encoded) != len(texts) + 2:
+        return None
+
+    tokens: list = list(encoded[0])
+    multipliers: list[float] = [1.0] * len(tokens)
+    factors: list[float] = [1.0] * len(tokens)
+    biases: list[float] = [0.0] * len(tokens)
+
+    for segment, (_, weight) in zip(encoded[1:-1], parsed):
+        multiplier, factor, bias = _levers(config, weight)
+        tokens.extend(segment)
+        multipliers.extend([multiplier] * len(segment))
+        factors.extend([factor] * len(segment))
+        biases.extend([bias] * len(segment))
+
+    tail = list(encoded[-1])
+    tokens.extend(tail)
+    multipliers.extend([1.0] * len(tail))
+    factors.extend([1.0] * len(tail))
+    biases.extend([0.0] * len(tail))
+
+    return tokens, multipliers, factors, biases
+
+
 def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
     """One prompt line -> the token stream plus the three rows indexed by it."""
-    global _warned_single_pass
+    global _warned_single_pass, _warned_joined
 
     parsed = weighted_segments(line, engine.emphasis.name)
 
@@ -294,11 +352,20 @@ def _tokenize_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Wei
         if single is not None:
             return single
 
+        joined = _tokenize_joined(engine, parsed, config)
+        if joined is not None:
+            #   the infotext records the option, not which path produced the stream; a
+            #   seam-level difference from the exact path is worth one line in the log
+            if not _warned_joined:
+                _warned_joined = True
+                logger.info("NegPiP: cannot locate the prompt fragments by character offset; tokenising the segments separately inside one chat template instead")
+            return joined
+
         #   the infotext records the option, not whether it engaged, so an unannounced
         #   fallback here reads afterwards as "one pass was on and made no difference"
         if not _warned_single_pass:
             _warned_single_pass = True
-            logger.warning("NegPiP: cannot locate the prompt fragments in the token stream; falling back to the split encoding for this prompt")
+            logger.warning("NegPiP: cannot tokenise the prompt in one pass; falling back to the split encoding for this prompt")
 
     return _tokenize_segmented(engine, parsed, config)
 
@@ -382,6 +449,7 @@ def _encode_line(engine: "Qwen3VLTextProcessingEngine", line: str, config: Weigh
 _warned_reference = False
 _warned_expanded = False
 _warned_single_pass = False
+_warned_joined = False
 
 
 def _reference_active(model: "Krea2", prompt) -> bool:
