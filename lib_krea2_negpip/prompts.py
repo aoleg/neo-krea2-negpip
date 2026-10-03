@@ -18,7 +18,7 @@ PROMPT_FIELDS = ("prompts", "negative_prompts", "hr_prompts", "hr_negative_promp
 
 
 def current_emphasis_name() -> str:
-    """The emphasis mode the text engine will parse with on the next encode."""
+    """The emphasis mode `text.py` will parse with on the next encode."""
     return emphasis.get_current_option(opts.emphasis).name
 
 

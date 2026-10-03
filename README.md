@@ -34,6 +34,8 @@ git clone https://github.com/aoleg/neo-krea2-negpip
 
 No extra dependencies.
 
+Needs Forge Neo from 2026-09-30 (commit `21886f41`, which rewrote the text encoders) or later. On an older Forge Neo, update Forge, or check out commit `8e283b1` of this extension.
+
 ## Quick start
 
 1. Load a Krea 2 checkpoint.
@@ -71,7 +73,7 @@ a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
 
 ![no weight, Forge's own emphasis, value emphasis, attention emphasis](scr/emphasis-levers.webp)
 
-Top left is the prompt with no weight at all — `red theme, blue theme`. With one-pass encoding on, that is the exact conditioning the two lever runs start from, so the lever is the only thing that differs. Top right is the extension switched off: Forge's own emphasis, which scales the text embedding by 2. Bottom left is **Amplify emphasis in values**, bottom right **Handle emphasis in attention** at gain `2.0`.
+Top left is the prompt with no weight at all — `red theme, blue theme`. With one-pass encoding on, that is the exact conditioning the two lever runs start from, so the lever is the only thing that differs. Top right is the extension switched off on a Forge Neo from before 2026-09-30: Forge's own emphasis, which scales the text embedding by 2. Current Forge Neo no longer applies emphasis to Krea 2 (see [Good to know](#good-to-know)), so that panel cannot be reproduced with the extension off today. Bottom left is **Amplify emphasis in values**, bottom right **Handle emphasis in attention** at gain `2.0`.
 
 Blue-dominant pixels: 8% with no weight, 24% Forge's own, 13% values, 57% attention. Both levers at once, not shown, reaches 68%. The attention lever is the strong one — it turns the room blue, curtains, sofa, walls, and pushes red out to one chair. The value lever at `2.0` moves the needle, but not far, and on this seed Forge's own emphasis moves it further. Do not expect the value lever to be a drop-in upgrade for `(word:2.0)`.
 
@@ -168,7 +170,7 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 ### Encode the prompt in one pass
 
-**What it does:** fixes something that happens to every weighted Krea 2 prompt, with or without this extension. Forge splits your prompt at each weight and sends the pieces to the text encoder separately — so `a portrait (blurry:-1.0) sharp` is read as three fragments rather than one sentence. This rejoins them, so the model reads exactly the prompt you would have written with no weights in it.
+**What it does:** keeps a weighted prompt one sentence. With the option off, the extension splits your prompt at each weight and sends the pieces to the text encoder separately — so `a portrait (blurry:-1.0) sharp` is read as three fragments rather than one sentence. That is how Forge Neo itself encoded every weighted Krea 2 prompt until 2026-09-30. With the option on, the pieces are rejoined, so the model reads exactly the prompt you would have written with no weights in it.
 
 Worse than it sounds: each fragment gets its own copy of Krea 2's whole chat template, and only the first copy's system instruction is stripped again afterwards. A single `(watermark:-1.0)` on a short prompt therefore roughly quadruples the text the model reads, and most of the addition is the same boilerplate instruction repeated — so the words you actually care about end up with a fraction of the attention they had.
 
@@ -202,7 +204,7 @@ All settings are saved into the image's generation parameters and paste back fro
 
 Adding `(watermark:-1.0)` should change watermarks, not skin texture. If the image comes out flatter and less detailed than the same prompt without the weight, two settings above are the cause, and both now default to the corrected behaviour:
 
-- **Encode the prompt in one pass** — on. The larger of the two by a distance. Off, a weight buries your prompt in repeated template boilerplate before any of this extension's machinery runs, and the same thing happens to a plain `(word:1.2)` with the extension disabled entirely.
+- **Encode the prompt in one pass** — on. The larger of the two by a distance. Off, a weight buries your prompt in repeated template boilerplate before any of this extension's machinery runs, and Forge Neo before 2026-09-30 did the same to a plain `(word:1.2)` with the extension disabled entirely.
 - **Reference the prompt mean** — `1.0`. Stops the flip from subtracting part of the conditioning along with the word.
 
 If you are reading this because an *old* image looked better, check its generation parameters: images made before these defaults changed carry `Krea2 NegPiP single pass: False` or no entry at all, and no `Krea2 NegPiP mean reference` line.
@@ -211,6 +213,7 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
+- **Weights the extension does not take.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. In a batch where the extension is active, a weight it does not take (for example `(word:1.2)` with the three opt-in settings off) still gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. The extension is active only when the prompt has a weight it takes, so a prompt with only positive weights and the opt-in settings off is encoded by Forge as written.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works

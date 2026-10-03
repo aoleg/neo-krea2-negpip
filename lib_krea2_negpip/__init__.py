@@ -61,8 +61,8 @@ class WeightConfig:
     branch carrying any of the magnitude, and the sign does not survive `SwiGLU` at all.
 
     Both replacements act inside attention instead, and each is a strict superset of doing
-    nothing — a weight this config does not claim keeps going through Forge's emphasis
-    exactly as it would without the extension installed.
+    nothing — a weight this config does not claim keeps going through the emphasis Forge
+    applied before `21886f41`, which `text.py` now applies itself.
 
     * `value_factor` scales the token's **value** vector.  Continuous: `1.0` is untouched,
       `0.0` removes the token's contribution, negative subtracts it, and above `1.0` it
