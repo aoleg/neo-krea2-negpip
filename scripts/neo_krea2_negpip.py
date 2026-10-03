@@ -77,7 +77,7 @@ class Krea2NegPiP(scripts.Script):
                 value=1.0,
                 step=0.05,
                 label="Value strength",
-                info="how far the weight is taken; 1.0 makes (word:-1.0) a plain sign flip, 0.0 is off",
+                info="how far the weight is taken; 1.0 makes (word:-1.0) a plain sign flip, 0.0 turns the value lever off and leaves every weight to emphasis",
             )
 
             mean_reference = gr.Slider(
@@ -198,16 +198,32 @@ class Krea2NegPiP(scripts.Script):
             single_pass=bool(single_pass),
         )
 
-        if not (config.uses_value or config.uses_bias):
-            return None
-
         if current_emphasis_name() == "None":
             self._warn_emphasis()
             return None
 
-        claimed, biased = scan(p, config)
-        if not claimed:
+        #   any weight, not only a claimed one: since Forge Neo `21886f41` the engine hands
+        #   Krea 2 weights to the encoder as literal text, so a batch the extension left
+        #   alone would read `(word:1.2)` brackets and all
+        weighted, claimed, biased = scan(p, config)
+        if not weighted:
             return None
+
+        options = {
+            "block_start": int(block_start),
+            "block_end": int(block_end),
+            "block_stride": int(block_stride),
+            "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
+            "mean_reference": min(1.0, max(0.0, float(mean_reference))),
+            "force_pytorch_attention": False,
+        }
+
+        if not claimed:
+            #   emphasis only: the text hook with neither lever, which returns Forge's own
+            #   conditioning shape, so the DiT is left untouched and the DiT options
+            #   cannot change the image
+            active = replace(config, strength=0.0, emphasis=False)
+            return model, None, config, active, options, (id(model), None, active)
 
         #   the emphasis lever ticked with nothing above 1.0 in the prompt has to switch
         #   itself off, not merely produce an all-zero row: emitting the row at all means
@@ -223,14 +239,7 @@ class Krea2NegPiP(scripts.Script):
         if not is_krea2_dit(dit):
             return None
 
-        options = {
-            "block_start": int(block_start),
-            "block_end": int(block_end),
-            "block_stride": int(block_stride),
-            "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
-            "mean_reference": min(1.0, max(0.0, float(mean_reference))),
-            "force_pytorch_attention": active.uses_bias,
-        }
+        options["force_pytorch_attention"] = active.uses_bias
 
         signature = (id(model), id(dit), active, tuple(sorted(options.items())))
 
@@ -285,7 +294,7 @@ class Krea2NegPiP(scripts.Script):
         cls._teardown()
 
         patch_text_encoder(model, active)
-        hooked = patch_dit(dit, **options)
+        hooked = patch_dit(dit, **options) if dit is not None else 0
 
         cls.model = model
         cls.dit = dit

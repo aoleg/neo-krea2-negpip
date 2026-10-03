@@ -23,20 +23,36 @@ def current_emphasis_name() -> str:
 
 
 def weighted_segments(line: str, emphasis_name: str) -> list[tuple[str, float]]:
-    """`(text, weight)` pairs, with the BREAK sentinel neutralised."""
-    return [(text, 1.0 if text.strip() in SENTINELS else float(weight)) for text, weight in parsing.parse_prompt_attention(line, emphasis_name)]
+    """`(text, weight)` pairs, with the BREAK sentinel neutralised.
+
+    The parser eats the whitespace around `BREAK`, so rejoining its segments for the
+    one-pass encode would read `hat BREAK a dog` as `hatBREAKa dog`.  Krea 2 has no chunk
+    boundary for it to mean, and Forge's own engine reads it as the literal word, so the
+    sentinel goes back in as a spaced word.
+    """
+    segments = []
+    for text, weight in parsing.parse_prompt_attention(line, emphasis_name):
+        if text.strip() in SENTINELS:
+            segments.append((f" {text.strip()} ", 1.0))
+        else:
+            segments.append((text, float(weight)))
+
+    return segments
 
 
-def scan(p: "StableDiffusionProcessing", config: WeightConfig) -> tuple[bool, bool]:
-    """`(any weight this config claims, any weight that needs a logit bias)`.
+def scan(p: "StableDiffusionProcessing", config: WeightConfig) -> tuple[bool, bool, bool]:
+    """`(any weight at all, any weight this config claims, any weight that needs a logit bias)`.
 
-    Both answers come out of one parse over every prompt of the batch, the Hires. fix
-    pass included.  The second one decides whether the attention backend has to be forced
-    to the one that accepts an additive mask, which is a cost worth avoiding when nothing
-    in the prompt asks for amplification.
+    All three come out of one parse over every prompt of the batch, the Hires. fix pass
+    included.  The first decides whether the extension acts at all: since Forge Neo
+    `21886f41` the engine reads Krea 2 weights as literal text, so any weight, claimed or
+    not, needs this extension's encode.  The second decides whether the DiT needs its
+    hooks.  The third decides whether the attention backend has to be forced to the one
+    that accepts an additive mask, which is a cost worth avoiding when nothing in the
+    prompt asks for amplification.
     """
     emphasis_name = current_emphasis_name()
-    handled = biased = False
+    weighted = handled = biased = False
 
     for field in PROMPT_FIELDS:
         for line in getattr(p, field, None) or ():
@@ -44,13 +60,14 @@ def scan(p: "StableDiffusionProcessing", config: WeightConfig) -> tuple[bool, bo
                 continue
 
             for _, weight in weighted_segments(line, emphasis_name):
+                weighted = weighted or weight != 1.0
                 handled = handled or config.handles(weight)
                 biased = biased or config.logit_bias(weight) != 0.0
 
                 if handled and biased:
-                    return True, True
+                    return True, True, True
 
-    return handled, biased
+    return weighted, handled, biased
 
 
 def reset_prompt_cache(p: "StableDiffusionProcessing"):

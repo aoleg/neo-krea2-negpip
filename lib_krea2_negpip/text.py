@@ -16,9 +16,9 @@ per-token rows applied inside attention after text fusion has run:
 * a **value factor**, multiplied into the value vectors (`WeightConfig.value_factor`);
 * a **logit bias**, added to the attention scores (`WeightConfig.logit_bias`).
 
-A weight the config does not claim is left alone and reaches emphasis as `abs(weight)`,
-which is Forge's own behaviour minus the sign that text fusion would have eaten.  See
-`dit.py` for the consuming end.
+A weight the config does not claim is left alone and reaches emphasis as itself, which is
+Forge's own behaviour; a negative one reaches it as `1.0`, since text fusion would eat the
+sign (§`_levers`).  See `dit.py` for the consuming end.
 
 Since Forge Neo `21886f41` (2026-09-30) that emphasis pass is this module's, not the
 engine's: `Qwen3VL4BEngine` has a read-only `EmphasisNone` and hands the prompt to the
@@ -126,15 +126,16 @@ def _levers(config: WeightConfig, weight: float) -> tuple[float, float, float]:
 
     A segment is either the emphasis pass's or ours, never both — a claimed weight leaves
     `1.0` behind in the multipliers, so the magnitude is applied once, at the lever that
-    can carry it.  `abs`, not the signed weight, for anything left to emphasis: a negated
-    hidden state is a different prompt, not an inverted one, which is the whole reason
-    this extension exists.
+    can carry it.  A negative weight is never left to emphasis as a sign: a negated hidden
+    state is a different prompt, not an inverted one, which is the whole reason this
+    extension exists.  One is unclaimed only at `Value strength` 0, which is "negative
+    weights do nothing", so it gets `1.0`.
     """
     factor = config.value_factor(weight)
     bias = config.logit_bias(weight)
     claimed = factor != 1.0 or bias != 0.0
 
-    return (1.0 if claimed else abs(weight)), factor, bias
+    return (1.0 if claimed or weight < 0.0 else weight), factor, bias
 
 
 def _tokenize_segmented(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
@@ -538,7 +539,9 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
     entry — a list indexes fine where `torch.stack` would have raised.
 
     Which keys the dict carries follows the *config*, not this batch's prompts, so cond
-    and uncond always agree on the shape even when only one of them uses a lever.
+    and uncond always agree on the shape even when only one of them uses a lever.  A
+    config with neither lever returns the bare list, the shape Forge's own engine returns:
+    that is the batch where only emphasis is needed.
     """
     if getattr(model, ORIGINAL_ATTR, None) is not None:
         return
@@ -596,6 +599,11 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
             count += claimed
 
         _report(prompt, count)
+
+        if not (config.uses_value or config.uses_bias):
+            #   emphasis only: Forge's own shape, so the DiT and `compile_conditions` need
+            #   no hooks at all
+            return conds
 
         result = {"crossattn": conds}
         if config.uses_value:

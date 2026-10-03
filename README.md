@@ -48,7 +48,7 @@ The console confirms it took effect, with the number of words affected:
 NegPiP Enable (Positive: 3)
 ```
 
-Nothing happens unless a prompt actually contains a negative weight, so it is safe to leave switched on all the time.
+Nothing happens unless a prompt contains a weight, so it is safe to leave switched on all the time. On current Forge Neo you want it on for any weighted Krea 2 prompt: since 2026-09-30 Forge reads `(word:1.2)` as literal text, brackets included, and this extension is what turns it back into a weight.
 
 ## What it looks like
 
@@ -112,9 +112,9 @@ With the default settings, the weight you type is the strength of the subtractio
 | `(word:1.0)` | Normal. No effect. |
 | `(word:2.0)` ‡ | The word contributes twice as much. Continues the same scale upwards: `1.5` is half again, `3.0` three times. |
 
-† Weights from `0` up to `1` — including `(word:0)` itself — are only handled once **Handle de-emphasis too** is switched on. Left off, they fall through to Forge's ordinary de-emphasis, and a prompt containing nothing but those will not engage the extension at all.
+† Weights from `0` up to `1` — including `(word:0)` itself — are only handled once **Handle de-emphasis too** is switched on. Left off, they get ordinary de-emphasis, which the extension applies the way Forge did before 2026-09-30.
 
-‡ Weights above `1` are only handled once **Amplify emphasis in values** (or **Handle emphasis in attention**) is switched on. Left off, they fall through to Forge's ordinary emphasis, which Krea 2 largely normalises away.
+‡ Weights above `1` are only handled once **Amplify emphasis in values** (or **Handle emphasis in attention**) is switched on. Left off, they get ordinary emphasis, applied the same way, which Krea 2 largely normalises away.
 
 Start at `-1.0`. If the thing is still there, go further negative; if the image starts looking distorted or fixated on the opposite, come back up.
 
@@ -126,7 +126,7 @@ Multi-word phrases work: `(plastic looking skin:-1.0)` affects all three words.
 
 **What it does:** scales every negative weight in the prompt at once. At `1.0` the weight you typed is used as-is, which is what the table above describes.
 
-**What you'll see:** turning it up makes every negative weight bite harder without editing the prompt — the quickest way to test whether a prompt needs more suppression. Turning it down softens all of them together. At `0.0` negative weights do nothing.
+**What you'll see:** turning it up makes every negative weight bite harder without editing the prompt — the quickest way to test whether a prompt needs more suppression. Turning it down softens all of them together. At `0.0` negative weights do nothing; other weights still get ordinary emphasis.
 
 Prefer editing individual weights once you know which word needs it; this is the global dial for when *everything* is too weak or too strong.
 
@@ -140,9 +140,9 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 ### Handle de-emphasis too
 
-**What it does:** takes over ordinary de-emphasis — weights between `0` and `1`, like `(word:0.7)` — instead of leaving it to Forge's normal handling.
+**What it does:** takes over ordinary de-emphasis — weights between `0` and `1`, like `(word:0.7)` — instead of leaving it to ordinary emphasis.
 
-**What you'll see:** de-emphasis becomes considerably more effective. Forge's normal approach scales the text embedding, and Krea 2's text encoder largely normalises that back out, so `(word:0.7)` often does very little. Handled here, it genuinely fades the word out, on the same continuum as the table above — and `(word:0)` becomes a clean deletion.
+**What you'll see:** de-emphasis becomes considerably more effective. Ordinary emphasis scales the text embedding, and Krea 2's text encoder largely normalises that back out, so `(word:0.7)` often does very little. Handled here, it genuinely fades the word out, on the same continuum as the table above — and `(word:0)` becomes a clean deletion.
 
 **Off by default** because `(word:0.8)` is common in ordinary prompts and this noticeably changes what those prompts produce. Turn it on if de-emphasis has felt like it does nothing.
 
@@ -176,7 +176,7 @@ Worse than it sounds: each fragment gets its own copy of Krea 2's whole chat tem
 
 **What you'll see:** weighted prompts stop drifting away from their unweighted versions. If you have noticed that adding a weight to a prompt changes the image more than the weight itself should account for — different composition, a different mood, a general loss of contrast and fine detail, not just more or less of the weighted word — this is the largest single cause, and this is the fix. The weights then do nothing but the job you gave them.
 
-**On by default.** Switch it off to reproduce images made before that changed.
+**On by default.** Switch it off to reproduce images made before that changed. Off, it also applies to a prompt whose only weights are ordinary ones such as `(word:1.2)`, which Forge Neo itself now encodes in one piece, so keep it on unless you are reproducing an old image.
 
 If the tokenizer cannot say where each fragment landed, the extension tokenises the fragments separately and splices them into one copy of the template instead — the sentence is the same, only a token or two at each seam can differ from the unweighted prompt, and the console says so once. The old behaviour of falling back to the split encoding is gone; that encoding is now only used with this option off.
 
@@ -196,7 +196,7 @@ All settings are saved into the image's generation parameters and paste back fro
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
-- **Is the weight negative?** With the three opt-in settings off, only negative weights do anything. `(word:1.5)` alone will not trigger it.
+- **Is the weight negative?** With the three opt-in settings off, only negative weights reach the levers. `(word:1.5)` alone gets ordinary emphasis and prints no `NegPiP Enable` line.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
 - **Is the checkpoint Krea 2?** It deliberately does nothing on other models.
 
@@ -213,7 +213,7 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
-- **Weights the extension does not take.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. In a batch where the extension is active, a weight it does not take (for example `(word:1.2)` with the three opt-in settings off) still gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. The extension is active only when the prompt has a weight it takes, so a prompt with only positive weights and the opt-in settings off is encoded by Forge as written.
+- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:1.2)` with the three opt-in settings off) gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, Forge reads the brackets as text.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works
