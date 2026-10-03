@@ -71,23 +71,27 @@ The prompt never asks for pillows; the model puts two on every sofa it draws any
 a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
 ```
 
-![no weight, Forge's own emphasis, value emphasis, attention emphasis](scr/emphasis-levers.webp)
+![no weight, extension off, ordinary emphasis, value emphasis, attention emphasis, both levers](scr/emphasis-levers.webp)
 
-Top left is the prompt with no weight at all — `red theme, blue theme`. With one-pass encoding on, that is the exact conditioning the two lever runs start from, so the lever is the only thing that differs. Top right is the extension switched off on a Forge Neo from before 2026-09-30: Forge's own emphasis, which scales the text embedding by 2. Current Forge Neo no longer applies emphasis to Krea 2 (see [Good to know](#good-to-know)), so that panel cannot be reproduced with the extension off today. Bottom left is **Amplify emphasis in values**, bottom right **Handle emphasis in attention** at gain `2.0`.
+Top left is the prompt with no weight at all — `red theme, blue theme`. With one-pass encoding on, that is the exact conditioning every lever run starts from, so the lever is the only thing that differs. Top middle is the extension switched off: since 2026-09-30 Forge Neo gives Krea 2 the brackets as text (see [Good to know](#good-to-know)), and the model paints `(Blue Theme:2.0)` on the wall. Top right is the extension on with its levers off: ordinary emphasis, which scales the text embedding by 2, the way Forge did before. Bottom row: **Amplify emphasis in values**, **Handle emphasis in attention** at gain `2.0` (the default is now `1.0`, see the ladders below), and both at once.
 
-Blue-dominant pixels: 8% with no weight, 24% Forge's own, 13% values, 57% attention. Both levers at once, not shown, reaches 68%. The attention lever is the strong one — it turns the room blue, curtains, sofa, walls, and pushes red out to one chair. The value lever at `2.0` moves the needle, but not far, and on this seed Forge's own emphasis moves it further. Do not expect the value lever to be a drop-in upgrade for `(word:2.0)`.
+Blue-dominant pixels (blue above both red and green by more than 10): 19% with no weight, 2% with the extension off, 19% ordinary emphasis, 39% values, 71% attention, 84% both. Ordinary emphasis is all but inert: the cushions shift, the room does not, because Krea 2's text stack normalises a scaled embedding back out, which is the problem both levers exist to get around. The value lever doubles the blue share and splits the room down the middle. The attention lever is the strong one: walls, rug and half the sofa go blue, and red keeps a lamp, a picture and the other half. Both together leave red little more than the accents.
 
-Why the gap: gain `2.0` multiplies the word's share of attention by e² ≈ 7.4, while the value lever doubles a contribution that was small to begin with. Linear is honest, but linear from a small number is small. Expect to need `3.0` on the value lever where `2.0` does the job in attention.
+Krea 2 Raw (int8) with the Turbo LoRA at `0.6`, seed 42, 1024×1024, 12 steps, Euler a, Beta, CFG 1, Settings → *Emphasis* `No norm`. The same settings are used in the ladders below.
 
-### The value lever is linear
+### Only the attention lever keeps scaling
 
 ```text
-a cute cat sitting on a sofa in a living room, red theme, blue theme   /   (blue theme:1.5)   /   2.0   /   3
+a cute cat sitting on a sofa in a living room, red theme, blue theme   /   (blue theme:1.5)   /   2   /   3
 ```
 
-![no weight, then value emphasis at 1.5, 2.0 and 3](scr/value-emphasis-ladder.webp)
+![values and attention at gain 1.0, each from no weight through 1.5, 2 and 3](scr/emphasis-ladders.webp)
 
-From the unweighted prompt on the left: `1.5` and `2.0` stay in the family — grey sofa, blue in the cushions, red in the throw — and `3` is where blue takes the curtains, the cushions and the throw. Monotonic, 8%, 10%, 13%, 28% blue-dominant, but not fast. One check that costs nothing: `(blue theme:1.5)` at Value strength `1.0` and `(blue theme:2.0)` at Value strength `0.5` are the same factor, and the two images are pixel-identical. That is the formula doing exactly what the table below says.
+Top row **Amplify emphasis in values**, bottom row **Handle emphasis in attention** at gain `1.0`, the default. Both rows jump at `1.5`, from a cat on a sofa to a whole room split red and blue, and the two `1.5` images are nearly the same picture: on this seed any early push towards blue flips the layout, so the first step is mostly that flip. After it the rows part. Values barely moves, 35%, 39%, 42% blue-dominant, and `3` re-frames the room rather than turning it blue. Attention keeps going, 36%, 43%, 71%, and `3` takes the walls and the rug. Ordinary emphasis, for comparison, stays at 18-19% all the way to `3`.
+
+The value factor is linear inside attention (`(word:2.0)` really does double what the word contributes there), but the image's response to it is not: what the word contributes is a small part of each block's output, and every block normalises again. The logit bias changes how much of the attention the word *captures*, which compounds over the blocks instead. That is why **Handle emphasis in attention** is on by default and **Amplify emphasis in values** is not.
+
+One check that costs nothing: the attention lever depends only on `gain × (weight - 1)`. `(blue theme:2)` at gain `1.0` and `(blue theme:1.5)` at gain `2.0` are pixel-identical, and so are `3` at `1.0` and `2` at `2.0`.
 
 ### Magnitude reaches the image
 
@@ -110,11 +114,11 @@ With the default settings, the weight you type is the strength of the subtractio
 | `(word:-0.5)` | A gentle push away. Good when `-1.0` overcorrects into something else. |
 | `(word:0)` † | The word is simply deleted from the image, without pushing away from it. Useful for a word the sentence needs in order to read naturally, but which you do not want rendered. |
 | `(word:1.0)` | Normal. No effect. |
-| `(word:2.0)` ‡ | The word contributes twice as much. Continues the same scale upwards: `1.5` is half again, `3.0` three times. |
+| `(word:2.0)` ‡ | The image attends to the word more. At the default gain `1.0` its share of attention grows by e^(weight - 1): ×1.6 at `1.5`, ×2.7 at `2.0`, ×7.4 at `3.0`. |
 
 † Weights from `0` up to `1` — including `(word:0)` itself — are only handled once **Handle de-emphasis too** is switched on. Left off, they get ordinary de-emphasis, which the extension applies the way Forge did before 2026-09-30.
 
-‡ Weights above `1` are only handled once **Amplify emphasis in values** (or **Handle emphasis in attention**) is switched on. Left off, they get ordinary emphasis, applied the same way, which Krea 2 largely normalises away.
+‡ Weights above `1` are handled by **Handle emphasis in attention**, on by default. Switched off (with **Amplify emphasis in values** off too), they get ordinary emphasis, which Krea 2 normalises away almost completely — see [the ladders above](#only-the-attention-lever-keeps-scaling).
 
 Start at `-1.0`. If the thing is still there, go further negative; if the image starts looking distorted or fixated on the opposite, come back up.
 
@@ -152,21 +156,21 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 **What you'll see:** emphasis that actually works. The usual kind runs into the same normalisation problem as de-emphasis above, which is why `(word:1.4)` on Krea 2 often looks much like `(word:1.0)`. Handled here, the emphasised word visibly takes over more of the image.
 
-**Off by default,** and it does cost a little speed while a prompt is using it. Turn it on if emphasis has felt inert.
+**On by default** since ordinary emphasis turned out to be close to inert on Krea 2. It costs a little speed while a prompt has a weight above `1`, because the attention has to run on the plain SDPA path to take the bias. Switch it off to reproduce images made before the default changed; images whose generation parameters carry NegPiP entries but no `Krea2 NegPiP emphasis` line paste back with it off.
 
 ### Emphasis gain
 
 **What it does:** how much a weight above `1` is worth, for the setting above.
 
-**What you'll see:** the effect grows very quickly — going from `2.0` to `4.0` is far more than twice as strong, and it compounds through the model. If an emphasised word starts dominating the image, smearing, or crowding out everything else in the prompt, lower this before lowering your prompt weights. `1.0` is a good starting point if `2.0` feels wild.
+**What you'll see:** the effect grows very quickly — going from `2.0` to `4.0` is far more than twice as strong, and it compounds through the model. If an emphasised word starts dominating the image, smearing, or crowding out everything else in the prompt, lower this before lowering your prompt weights. Defaults to `1.0`; it used to be `2.0`, which at `(word:3)` turns the whole frame.
 
 ### Amplify emphasis in values
 
 **What it does:** takes over emphasis — weights above `1` — and applies it with the same lever a negative weight uses, continued upwards: `(word:2.0)` makes the word contribute twice as much to every part of the image that attends to it, `(word:-1.0)` makes it contribute the opposite, and `(word:1.0)` sits in between. **Value strength** scales this the same way it scales negative weights.
 
-**What you'll see:** emphasis in the same currency as suppression, and gentler than the attention lever at the same number — see [the sheets above](#the-two-emphasis-levers). Compared with **Handle emphasis in attention**, this one is linear — `3.0` really is three times `1.0` — and it does not saturate, so large weights keep growing rather than levelling off, and it costs nothing in speed on any attention backend. Expect to reach for `3.0` where the other lever does it at `2.0`. The other one changes how much of the image's attention the word *captures* from the rest of the prompt, which is a different effect; try both on a fixed seed and keep the one that reads as emphasis to you. Switching both on at once is allowed but doubles up.
+**What you'll see:** emphasis in the same currency as suppression, and much flatter than the attention lever: the factor is linear inside attention, but the image's response levels off quickly — see [the ladders above](#only-the-attention-lever-keeps-scaling). It costs nothing in speed on any attention backend. Switching it on next to the attention lever adds to it (84% blue-dominant against 71% for attention alone at gain `2.0` in [the sheet above](#the-two-emphasis-levers)).
 
-**Off by default,** for the same reason as the setting above.
+**Off by default.** Turn it on with the attention lever off if you need emphasis without the speed cost of the plain SDPA path.
 
 ### Encode the prompt in one pass
 
@@ -196,7 +200,7 @@ All settings are saved into the image's generation parameters and paste back fro
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
-- **Is the weight negative?** With the three opt-in settings off, only negative weights reach the levers. `(word:1.5)` alone gets ordinary emphasis and prints no `NegPiP Enable` line.
+- **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if **Handle emphasis in attention** has been switched off.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
 - **Is the checkpoint Krea 2?** It deliberately does nothing on other models.
 
@@ -213,7 +217,7 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
-- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:1.2)` with the three opt-in settings off) gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, Forge reads the brackets as text.
+- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, Forge reads the brackets as text.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works

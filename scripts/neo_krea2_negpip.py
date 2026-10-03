@@ -96,15 +96,15 @@ class Krea2NegPiP(scripts.Script):
             )
 
             handle_emphasis = gr.Checkbox(
-                False,
+                True,
                 label="Handle emphasis in attention",
-                info="make weights above 1 raise how much the image attends to the word, which survives the text-fusion norms — scaling the embedding largely does not",
+                info="make weights above 1 raise how much the image attends to the word, which survives the text-fusion norms — scaling the embedding does not, so without this or the value lever a weight above 1 is close to inert on Krea 2",
             )
 
             emphasis_gain = gr.Slider(
                 minimum=0.0,
                 maximum=MAX_GAIN,
-                value=2.0,
+                value=1.0,
                 step=0.05,
                 label="Emphasis gain",
                 info="attention weight is multiplied by exp(gain x (weight - 1)), so this compounds quickly over blocks",
@@ -113,7 +113,7 @@ class Krea2NegPiP(scripts.Script):
             handle_value_emphasis = gr.Checkbox(
                 False,
                 label="Amplify emphasis in values",
-                info="make weights above 1 scale what the word contributes, the same lever a negative weight uses, continued upwards: (word:2.0) contributes twice; linear, never saturates, works on every attention backend; Value strength applies",
+                info="make weights above 1 scale what the word contributes, the same lever a negative weight uses, continued upwards: (word:2.0) contributes twice; linear inside attention, but the image's response flattens quickly; works on every attention backend; Value strength applies",
             )
 
             single_pass = gr.Checkbox(
@@ -135,19 +135,28 @@ class Krea2NegPiP(scripts.Script):
 
                 block_stride = gr.Slider(minimum=1, maximum=16, value=1, step=1, label="Block stride", info="act in every Nth block of the range")
 
+        #   the infotext only records a setting that is on or off its default, and Forge
+        #   leaves a field alone when its key is missing — so a pasted image would keep
+        #   whatever the UI shows, which for "Handle emphasis in attention" (default changed
+        #   to on) is the opposite of what an older image was made with.  A NegPiP image
+        #   with the key missing means the setting was at the value it implies; an image
+        #   with no NegPiP entries at all leaves the panel alone.
+        def recorded(key, absent):
+            return lambda d: (d[key] if key in d else absent) if "Krea2 NegPiP value strength" in d else None
+
         self.infotext_fields = [
             (enable, lambda d: "Krea2 NegPiP value strength" in d),
             (value_strength, "Krea2 NegPiP value strength"),
             (mean_reference, "Krea2 NegPiP mean reference"),
-            (handle_deemphasis, "Krea2 NegPiP de-emphasis"),
-            (handle_emphasis, "Krea2 NegPiP emphasis"),
+            (handle_deemphasis, recorded("Krea2 NegPiP de-emphasis", False)),
+            (handle_emphasis, recorded("Krea2 NegPiP emphasis", False)),
             (emphasis_gain, "Krea2 NegPiP emphasis gain"),
-            (handle_value_emphasis, "Krea2 NegPiP value emphasis"),
+            (handle_value_emphasis, recorded("Krea2 NegPiP value emphasis", False)),
             (single_pass, "Krea2 NegPiP single pass"),
-            (patch_txtfusion_refiners, "Krea2 NegPiP refiners"),
-            (block_start, "Krea2 NegPiP first block"),
-            (block_end, "Krea2 NegPiP last block"),
-            (block_stride, "Krea2 NegPiP block stride"),
+            (patch_txtfusion_refiners, recorded("Krea2 NegPiP refiners", False)),
+            (block_start, recorded("Krea2 NegPiP first block", 0)),
+            (block_end, recorded("Krea2 NegPiP last block", DEFAULT_LAST_BLOCK)),
+            (block_stride, recorded("Krea2 NegPiP block stride", 1)),
         ]
 
         return [enable, value_strength, mean_reference, handle_deemphasis, handle_emphasis, emphasis_gain, handle_value_emphasis, single_pass, patch_txtfusion_refiners, block_start, block_end, block_stride]
