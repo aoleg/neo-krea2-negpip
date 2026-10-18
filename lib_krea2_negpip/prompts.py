@@ -9,6 +9,7 @@ from backend.text_processing import emphasis, parsing
 from modules.shared import opts
 
 from lib_krea2_negpip import WeightConfig
+from lib_krea2_negpip.adapters import ModelAdapter
 
 #   `parse_prompt_attention` marks a BREAK with the sentinel weight -1.  It is not a
 #   weighted token and must never be read as one — sd-webui-negpip skips the same set.
@@ -26,9 +27,9 @@ def weighted_segments(line: str, emphasis_name: str) -> list[tuple[str, float]]:
     """`(text, weight)` pairs, with the BREAK sentinel neutralised.
 
     The parser eats the whitespace around `BREAK`, so rejoining its segments for the
-    one-pass encode would read `hat BREAK a dog` as `hatBREAKa dog`.  Krea 2 has no chunk
-    boundary for it to mean, and Forge's own engine reads it as the literal word, so the
-    sentinel goes back in as a spaced word.
+    one-pass encode would read `hat BREAK a dog` as `hatBREAKa dog`.  Neither Krea 2 nor
+    MOSS-Image has a chunk boundary for it to mean, and both engines read it as the
+    literal word, so the sentinel goes back in as a spaced word.
     """
     segments = []
     for text, weight in parsing.parse_prompt_attention(line, emphasis_name):
@@ -40,23 +41,26 @@ def weighted_segments(line: str, emphasis_name: str) -> list[tuple[str, float]]:
     return segments
 
 
-def scan(p: "StableDiffusionProcessing", config: WeightConfig) -> tuple[bool, bool, bool]:
+def scan(p: "StableDiffusionProcessing", config: WeightConfig, adapter: ModelAdapter) -> tuple[bool, bool, bool]:
     """`(any weight at all, any weight this config claims, any weight that needs a logit bias)`.
 
     All three come out of one parse over every prompt of the batch, the Hires. fix pass
     included.  The first decides whether the extension acts at all: since Forge Neo
-    `21886f41` the engine reads Krea 2 weights as literal text, so any weight, claimed or
-    not, needs this extension's encode.  The second decides whether the DiT needs its
-    hooks.  The third decides whether the attention backend has to be forced to the one
-    that accepts an additive mask, which is a cost worth avoiding when nothing in the
-    prompt asks for amplification.
+    `21886f41` the engine reads Krea 2 weights as literal text, and the MOSS-Image engine
+    always did, so any weight, claimed or not, needs this extension's encode.  The second
+    decides whether the DiT needs its hooks.  The third decides whether the attention
+    backend has to be forced to the one that accepts an additive mask, which is a cost
+    worth avoiding when nothing in the prompt asks for amplification.
+
+    A line the adapter encodes verbatim (a MOSS-Image layout) is data, not a prompt with
+    weights in it, and never activates anything.
     """
     emphasis_name = current_emphasis_name()
     weighted = handled = biased = False
 
     for field in PROMPT_FIELDS:
         for line in getattr(p, field, None) or ():
-            if not isinstance(line, str):
+            if not isinstance(line, str) or adapter.is_verbatim(line):
                 continue
 
             for _, weight in weighted_segments(line, emphasis_name):

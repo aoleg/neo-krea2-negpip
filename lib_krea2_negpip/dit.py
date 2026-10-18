@@ -1,5 +1,5 @@
 """
-Diffusion-model side of Krea 2 NegPiP.
+Diffusion-model side of NegPiP.
 
 Two levers, both applied inside attention, after every non-linear conditioning stage has
 already run:
@@ -18,47 +18,38 @@ already run:
   keys lose the share the flagged one gains.  It saturates as that share approaches one,
   and it needs an attention backend that accepts an additive mask.
 
-Krea 2 never passes an attention mask — `SingleStreamDiT.forward` hands `None` to every
-block and to `txtfusion` — so the bias rides the `mask` argument that is already threaded
-through `Attention.forward` to `attention_function`, and no attention math needs copying.
-It does have to reach a backend that accepts an additive mask, hence the
-`attention_function` rebind below, which is installed only when a prompt actually asks
-for amplification.
+Both models this extension handles are single-stream: the text tokens and the image
+patches share one self-attention sequence, so there is no cross-attention module to hook
+and the flip goes on the value projection of the blocks themselves, over the text
+positions of the joint sequence — the leading `txtlen` on Krea 2, the trailing `txtlen`
+on MOSS-Image.  Each model's text refiner blocks are the same kind of attention one stage
+earlier, over the text alone; flipping there as well is optional and stronger.
 
-Krea 2 is single-stream — `SingleStreamDiT.forward` concatenates the fused text context
-and the image patches into one sequence and runs plain self-attention over the pair
-(`backend/nn/krea.py`).  There is no cross-attention module to hook, so the flip goes on
-the value projection of the blocks themselves, over the leading `txtlen` positions.  The
-text-fusion refiner blocks are the same `Attention` class one stage earlier, over the
-text alone; flipping there as well is optional and stronger.
+Two levels of hook, so none of either model's attention math is duplicated here:
 
-`txtfusion.layerwise_blocks` are deliberately *not* touched: they run at
-`(batch * seq, taps, dim)`, so their sequence axis is the 12-layer tap stack, and the
-mask does not index it.
+* the module nearest the attention that receives `transformer_options` gets its `forward`
+  wrapped: it parks the value factors on itself for the duration of one call and gets the
+  logit bias into the attention the way its model allows (`ModelAdapter.wrap_attention`);
+* the `nn.Linear` that produces the values gets a wrapper that scales the rows the parked
+  factors name.
 
-Two levels of hook, so none of Forge's own attention math is duplicated here:
+That linear returns `(B, L, heads * headdim)` before the rearrange into heads, so scaling a
+whole row scales that token in every head at once; where q, k and v come out of one fused
+projection, the adapter says which columns are the values.
 
-* the selected `Attention.forward` parks the value factors on the module for the duration
-  of one call, and substitutes the logit bias for the unused `mask` argument — it is the
-  only place that sees `transformer_options`;
-* that module's `wv` (`nn.Linear`) gets a wrapper that scales the rows it names.
-
-`wv` returns `(B, L, kvheads * headdim)` before the rearrange into heads, so scaling a
-whole row scales that token in every kv head at once.
+Where the text sits, which modules those are, and how a mask reaches the attention are
+the adapter's business (`adapters.py`); this module owns the levers and the hooking.
 """
 
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any
 
 import torch
 
-from backend.attention import attention_pytorch
 from backend.sampling import condition, sampling_function
-from modules.processing import logger
 
 from lib_krea2_negpip import (
-    KREA2_TAP_DIM,
-    KREA2_TAP_LAYERS,
     NEGPIP_BIAS_KEY,
     NEGPIP_BIAS_OPTION_KEY,
     NEGPIP_MASK_KEY,
@@ -67,34 +58,13 @@ from lib_krea2_negpip import (
     ROLE_BLOCK,
     ROLE_REFINER,
 )
+from lib_krea2_negpip.adapters import AttentionSite, ModelAdapter
 
 ACTIVE_ATTR = "_krea2_negpip_active_mask"
 REFERENCE_ATTR = "_krea2_negpip_mean_reference"
 ORIGINAL_FORWARD = "_krea2_negpip_original_forward"
-ORIGINAL_WV = "_krea2_negpip_original_wv_forward"
+ORIGINAL_VALUE = "_krea2_negpip_original_value_forward"
 ORIGINAL_ATTENTION = "_krea2_negpip_original_attention_function"
-
-_warned_mask = False
-
-
-def is_krea2_dit(dit: Any) -> bool:
-    """Whether this diffusion model really is the Krea 2 `SingleStreamDiT`.
-
-    Duck-typed on what this extension actually touches, and nothing else: Forge moved the
-    tap-stack unpacking out of the DiT and into the text engine, and detecting on the
-    `_unpack_context` that used to do it made the extension stand down silently — the
-    worst possible failure, since everything else still looked healthy.
-    """
-    try:
-        txtlayers = int(getattr(dit, "txtlayers", 0))
-        txtdim = int(getattr(dit, "txtdim", 0))
-    except (TypeError, ValueError):
-        return False
-
-    if txtlayers != KREA2_TAP_LAYERS or txtdim != KREA2_TAP_DIM:
-        return False
-
-    return hasattr(dit, "blocks") and hasattr(dit, "txtmlp") and hasattr(getattr(dit, "txtfusion", None), "refiner_blocks")
 
 
 def selected_blocks(count: int, start: int, end: int, stride: int) -> list[int]:
@@ -109,16 +79,6 @@ def selected_blocks(count: int, start: int, end: int, stride: int) -> list[int]:
     stride = max(1, int(stride))
 
     return [i for i in range(start, end + 1) if (i - start) % stride == 0]
-
-
-def _attention_modules(dit: Any):
-    """Every `Attention` the flip may legitimately reach, block-major then refiners."""
-    for block in getattr(dit, "blocks", []) or []:
-        yield getattr(block, "attn", None)
-
-    txtfusion = getattr(dit, "txtfusion", None)
-    for block in getattr(txtfusion, "refiner_blocks", []) or []:
-        yield getattr(block, "attn", None)
 
 
 # ================================================================================ #
@@ -140,6 +100,11 @@ def _align_batch(row: torch.Tensor, batch: int) -> torch.Tensor | None:
     return row.repeat(batch // row.shape[0], *([1] * (row.ndim - 1)))
 
 
+def _text_span(length: int, total: int, text_first: bool) -> slice:
+    """The `length` text positions of a joint sequence `total` long."""
+    return slice(0, length) if text_first else slice(total - length, total)
+
+
 def _mean_value(text: torch.Tensor, m: torch.Tensor, amount: float) -> torch.Tensor:
     """`amount` x the mean value vector of the text tokens this row leaves alone.
 
@@ -159,7 +124,7 @@ def _mean_value(text: torch.Tensor, m: torch.Tensor, amount: float) -> torch.Ten
     return (mean * amount).to(text.dtype)
 
 
-def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.0) -> torch.Tensor:
+def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.0, text_first: bool = True) -> torch.Tensor:
     """Scale the flagged tokens' value vectors, about `reference` x the prompt's mean.
 
     `reference = 0.0` is NegPiP as written — `v -> m*v`, a reflection about the origin.
@@ -167,15 +132,17 @@ def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.
     *convex* combination of value vectors, and the text tokens' values share a large
     common component, so `m = -1` subtracts `2*a_t` of that common component from every
     query in the sequence — the image patches and, this being a single-stream DiT, the
-    text tokens as well, at each of the 28 blocks.  A shared offset on every token is
-    exactly what the next block's `RMSNorm` divides out at the expense of the token-to-
-    token variation around it, which is spatial detail.
+    text tokens as well, at every block.  A shared offset on every token is exactly what
+    the next block's `RMSNorm` divides out at the expense of the token-to-token variation
+    around it, which is spatial detail.
 
     `reference = 1.0` reflects about the prompt's own mean value vector instead:
     `v -> vbar + m*(v - vbar)`.  Writing `v = vbar + d`, the perturbation is then
     `(m-1)*d` rather than `(m-1)*(vbar + d)` — the shared component of the change is
     exactly zero, and only the part that says *which word this is* gets inverted.  The
     suppression is unchanged; what stops happening is the broadband softening.
+
+    Written in place, so a view into a fused q/k/v output is scaled where it lies.
     """
     if not torch.is_tensor(v) or v.ndim != 3:
         return v
@@ -188,39 +155,58 @@ def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.
     if m is None:
         return v
 
+    span = _text_span(length, int(v.shape[1]), text_first)
+
     if reference > 0.0:
         #   v' = r + m*(v - r) = m*v + r*(1 - m); `r` has to be read before the write
-        r = _mean_value(v[:, :length, :], m, reference)
-        v[:, :length, :] = v[:, :length, :] * m + r * (1.0 - m)
+        r = _mean_value(v[:, span, :], m, reference)
+        v[:, span, :] = v[:, span, :] * m + r * (1.0 - m)
     else:
-        v[:, :length, :] = v[:, :length, :] * m
+        v[:, span, :] = v[:, span, :] * m
 
     return v
 
 
-def _attention_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor | None:
-    """`(B, 1, keys)` additive logit bias over this module's whole key axis, or `None`.
+def attention_bias(batch: int, keys: int, bias: torch.Tensor, text_first: bool, like: torch.Tensor) -> torch.Tensor | None:
+    """`(B, 1, keys)` additive logit bias over a module's whole key axis, or `None`.
 
-    The row only covers the text tokens; the main blocks attend over `cat(text, image)`,
-    so it is zero-padded out to the full sequence.  `(B, 1, keys)` is what
-    `attention_pytorch` unsqueezes to `(B, 1, 1, keys)` — one bias per batch row, which
-    is what keeps cond and uncond from reading each other's row.
+    The row only covers the text tokens; the main blocks attend over the joint sequence,
+    so it is zero-padded out to the full key axis, at whichever end the text sits.
+    `(B, 1, keys)` is what `attention_pytorch` unsqueezes to `(B, 1, 1, keys)` — one bias
+    per batch row, which is what keeps cond and uncond from reading each other's row.
+    `like` only lends its device and dtype.
     """
     if not torch.is_tensor(bias) or bias.ndim != 3:
         return None
 
-    batch, keys = int(x.shape[0]), int(x.shape[1])
     length = min(int(bias.shape[1]), keys)
     if length <= 0:
         return None
 
-    row = _align_batch(bias[:, :length, :].to(device=x.device, dtype=x.dtype), batch)
+    row = _align_batch(bias[:, :length, :].to(device=like.device, dtype=like.dtype), batch)
     if row is None:
         return None
 
-    out = x.new_zeros((batch, 1, keys))
-    out[:, 0, :length] = row[:, :, 0]
+    out = like.new_zeros((batch, 1, keys))
+    out[:, 0, _text_span(length, keys, text_first)] = row[:, :, 0]
     return out
+
+
+@contextmanager
+def active(site: AttentionSite, transformer_options: Any):
+    """Park this call's value factors on the site's module; yield its logit bias, if any.
+
+    The value wrapper below reads the parked factors; the adapter's `forward` wrapper
+    takes the yielded bias and gets it into the attention.  Cleared on the way out, so a
+    module never carries a row into a call that did not bring one.
+    """
+    options = transformer_options if isinstance(transformer_options, dict) else {}
+
+    setattr(site.module, ACTIVE_ATTR, options.get(NEGPIP_OPTION_KEY, None))
+    try:
+        yield options.get(NEGPIP_BIAS_OPTION_KEY, None)
+    finally:
+        setattr(site.module, ACTIVE_ATTR, None)
 
 
 def _restore_forward(obj: Any, original: Any):
@@ -236,95 +222,79 @@ def _restore_forward(obj: Any, original: Any):
         obj.forward = original
 
 
-def _hook_wv(attn: Any, remove: bool):
-    wv = getattr(attn, "wv", None)
-    if wv is None:
+def _hook_value(adapter: ModelAdapter, site: AttentionSite, remove: bool):
+    value = site.value
+    if value is None:
         return
 
     if remove:
-        original = getattr(wv, ORIGINAL_WV, None)
+        original = getattr(value, ORIGINAL_VALUE, None)
         if original is not None:
-            if getattr(wv.forward, "_negpip", False):
-                _restore_forward(wv, original)
-            delattr(wv, ORIGINAL_WV)
+            if getattr(value.forward, "_negpip", False):
+                _restore_forward(value, original)
+            delattr(value, ORIGINAL_VALUE)
         return
 
-    if getattr(wv, ORIGINAL_WV, None) is not None:
+    if getattr(value, ORIGINAL_VALUE, None) is not None:
         return
 
-    original = wv.forward
+    original = value.forward
+    module, columns, text_first = site.module, site.value_slice, adapter.text_first
 
     @wraps(original)
     def negpip_forward(*args, **kwargs):
         out = original(*args, **kwargs)
-        mask = getattr(attn, ACTIVE_ATTR, None)
-        if mask is None:
+        mask = getattr(module, ACTIVE_ATTR, None)
+        if mask is None or not torch.is_tensor(out):
             return out
-        return _apply_value_flip(out, mask, getattr(attn, REFERENCE_ATTR, 0.0))
+
+        reference = getattr(module, REFERENCE_ATTR, 0.0)
+        if columns is None:
+            return _apply_value_flip(out, mask, reference, text_first)
+
+        #   a view: the values are scaled where they lie, and q and k are not touched
+        _apply_value_flip(out[..., columns], mask, reference, text_first)
+        return out
 
     negpip_forward._negpip = True
 
-    setattr(wv, ORIGINAL_WV, original)
-    wv.forward = negpip_forward
+    setattr(value, ORIGINAL_VALUE, original)
+    value.forward = negpip_forward
 
 
-def _hook_attention(attn: Any, role: str = "", mean_reference: float = 0.0, remove: bool = False):
+def _hook_attention(adapter: ModelAdapter, site: AttentionSite, mean_reference: float = 0.0, remove: bool = False):
+    module = site.module
+
     if remove:
-        original = getattr(attn, ORIGINAL_FORWARD, None)
+        original = getattr(module, ORIGINAL_FORWARD, None)
         if original is not None:
-            if getattr(attn.forward, "_negpip", False):
-                _restore_forward(attn, original)
-            delattr(attn, ORIGINAL_FORWARD)
+            if getattr(module.forward, "_negpip", False):
+                _restore_forward(module, original)
+            delattr(module, ORIGINAL_FORWARD)
 
-        _hook_wv(attn, True)
+        _hook_value(adapter, site, True)
 
         for name in (NEGPIP_ROLE_ATTR, ACTIVE_ATTR, REFERENCE_ATTR):
-            if hasattr(attn, name):
-                delattr(attn, name)
+            if hasattr(module, name):
+                delattr(module, name)
         return
 
     #   before the already-hooked check: the slider may have moved without anything else
     #   about the patch changing, and a stale reference is a silently wrong image
-    setattr(attn, REFERENCE_ATTR, float(mean_reference))
+    setattr(module, REFERENCE_ATTR, float(mean_reference))
 
-    if getattr(attn, ORIGINAL_FORWARD, None) is not None:
+    if getattr(module, ORIGINAL_FORWARD, None) is not None:
         return
 
-    _hook_wv(attn, False)
-    original = attn.forward
+    _hook_value(adapter, site, False)
+    original = module.forward
 
-    @wraps(original)
-    def negpip_forward(x, freqs=None, mask=None, transformer_options={}):
-        global _warned_mask
-
-        options = transformer_options if isinstance(transformer_options, dict) else {}
-        bias = options.get(NEGPIP_BIAS_OPTION_KEY, None)
-
-        if bias is not None and torch.is_tensor(x):
-            if mask is None:
-                mask = _attention_bias(x, bias)
-            elif not _warned_mask:
-                #   Krea 2 has never passed one; if that changes, adding the bias to
-                #   somebody else's mask is not obviously the right merge, so say so
-                _warned_mask = True
-                logger.warning("NegPiP: attention already carries a mask, skipping the emphasis bias")
-
-        setattr(attn, ACTIVE_ATTR, options.get(NEGPIP_OPTION_KEY, None))
-        try:
-            #   by keyword past the required positional: a parameter interposed before
-            #   `transformer_options` would otherwise silently take our options dict and
-            #   leave the real one at its default, which is a working forward pass that
-            #   quietly does nothing.  The ComfyUI node hit exactly this when Krea 2 Edit
-            #   added `ref_latents` to the signature there.
-            return original(x, freqs=freqs, mask=mask, transformer_options=transformer_options)
-        finally:
-            setattr(attn, ACTIVE_ATTR, None)
-
+    negpip_forward = adapter.wrap_attention(site, original)
     negpip_forward._negpip = True
 
-    setattr(attn, NEGPIP_ROLE_ATTR, role)
-    setattr(attn, ORIGINAL_FORWARD, original)
-    attn.forward = negpip_forward
+    setattr(module, NEGPIP_ROLE_ATTR, site.role)
+    setattr(module, ORIGINAL_FORWARD, original)
+    module.forward = negpip_forward
 
 
 def _hook_dit(dit: Any, remove: bool):
@@ -342,20 +312,26 @@ def _hook_dit(dit: Any, remove: bool):
     original = dit.forward
 
     @wraps(original)
-    def negpip_forward(x, timesteps, context, attention_mask=None, transformer_options=None, **kwargs):
+    def negpip_forward(x, timesteps, context, *args, transformer_options=None, **kwargs):
         mask = kwargs.pop(NEGPIP_MASK_KEY, None)
         bias = kwargs.pop(NEGPIP_BIAS_KEY, None)
         options = dict(transformer_options or {})
 
-        #   conditioning arrives as (batch, seq, taps, dim), so a row indexed 1:1 with its
-        #   token axis arrives as (batch, seq, 1, 1)
+        #   a row indexed 1:1 with the conditioning's token axis arrives batched like it:
+        #   (batch, seq, 1, 1) behind Krea 2's (batch, seq, taps, dim), (batch, seq, 1)
+        #   behind MOSS-Image's (batch, seq, dim)
         if torch.is_tensor(mask):
             options[NEGPIP_OPTION_KEY] = mask.reshape(mask.shape[0], -1, 1)
         if torch.is_tensor(bias):
             options[NEGPIP_BIAS_OPTION_KEY] = bias.reshape(bias.shape[0], -1, 1)
 
-        #   keyword past the required positionals, for the reason in `_hook_attention`
-        return original(x, timesteps, context, attention_mask=attention_mask, transformer_options=options, **kwargs)
+        #   by keyword past the required positionals: a parameter interposed before
+        #   `transformer_options` would otherwise silently take our options dict and
+        #   leave the real one at its default, which is a working forward pass that
+        #   quietly does nothing.  The ComfyUI node hit exactly this when Krea 2 Edit
+        #   added `ref_latents` to the signature there.  Forge itself calls the model with
+        #   `context`, `control` and `transformer_options` by keyword (`k_model.py`).
+        return original(x, timesteps, context, *args, transformer_options=options, **kwargs)
 
     negpip_forward._negpip = True
 
@@ -367,8 +343,8 @@ def _hook_compile_conditions():
     """Teach `compile_conditions` the conditioning shape the text hook produces.
 
     It knows two: a bare tensor, or a dict carrying both `crossattn` and a pooled
-    `vector`.  Krea 2 NegPiP makes a third — `crossattn` plus the per-token rows, no
-    pooled vector — and the stock function would raise `KeyError: 'vector'` on it.
+    `vector`.  NegPiP makes a third — `crossattn` plus the per-token rows, no pooled
+    vector — and the stock function would raise `KeyError: 'vector'` on it.
 
     A plain `Condition`, not `ConditionCrossAttn`: the rows are 1:1 with the conditioning
     they describe, and `ConditionCrossAttn.concat` would repeat them to a common length
@@ -404,79 +380,48 @@ def _hook_compile_conditions():
     sampling_function.compile_conditions = compile_conditions
 
 
-def _force_pytorch_attention(enable: bool):
-    """Point `krea.attention_function` at the backend that takes an additive mask.
-
-    Sage and flash attention do not accept an arbitrary float mask, so the logit bias
-    needs the plain SDPA path.  `backend/nn/krea.py` binds the name at import time, so
-    the module's own reference is the one to rebind — the same reason `compile_conditions`
-    has to be patched in two places.
-
-    Only installed while a prompt actually asks for amplification: taking the optimised
-    backend away from everyone who just wants a value flip would be a silent slowdown.
-    """
-    from backend.nn import krea
-
-    if not enable:
-        original = getattr(krea, ORIGINAL_ATTENTION, None)
-        if original is not None:
-            krea.attention_function = original
-            delattr(krea, ORIGINAL_ATTENTION)
-        return
-
-    if hasattr(krea, ORIGINAL_ATTENTION) or krea.attention_function is attention_pytorch:
-        return
-
-    setattr(krea, ORIGINAL_ATTENTION, krea.attention_function)
-    krea.attention_function = attention_pytorch
-
-
 # ================================================================================ #
 
 
-def patch_dit(dit: Any, *, block_start: int, block_end: int, block_stride: int, patch_txtfusion_refiners: bool, mean_reference: float = 1.0, force_pytorch_attention: bool = False) -> int:
-    """Hook the DiT forward and the value projection of every selected attention module.
+def patch_dit(adapter: ModelAdapter, dit: Any, *, block_start: int, block_end: int, block_stride: int, patch_refiners: bool, mean_reference: float = 1.0, force_pytorch_attention: bool = False) -> int:
+    """Hook the DiT forward and the value projection of every selected attention site.
 
-    Returns how many attention modules were hooked.
+    Returns how many sites were hooked.
     """
     _hook_compile_conditions()
-    _force_pytorch_attention(force_pytorch_attention)
+    adapter.force_pytorch_attention(dit, force_pytorch_attention)
     _hook_dit(dit, False)
 
     hooked = 0
 
-    blocks = list(getattr(dit, "blocks", []) or [])
+    blocks = adapter.block_sites(dit)
     for i in selected_blocks(len(blocks), block_start, block_end, block_stride):
-        attn = getattr(blocks[i], "attn", None)
-        if attn is not None:
-            _hook_attention(attn, ROLE_BLOCK, mean_reference)
-            hooked += 1
+        _hook_attention(adapter, blocks[i], mean_reference)
+        hooked += 1
 
-    if patch_txtfusion_refiners:
-        txtfusion = getattr(dit, "txtfusion", None)
-        for block in getattr(txtfusion, "refiner_blocks", []) or []:
-            attn = getattr(block, "attn", None)
-            if attn is not None:
-                _hook_attention(attn, ROLE_REFINER, mean_reference)
-                hooked += 1
+    if patch_refiners:
+        for site in adapter.refiner_sites(dit):
+            _hook_attention(adapter, site, mean_reference)
+            hooked += 1
 
     return hooked
 
 
-def unpatch_dit(dit: Any):
+def unpatch_dit(adapter: ModelAdapter, dit: Any):
     """Undo everything `patch_dit` did, block selection or not.
 
-    Sweeps every candidate module rather than replaying the selection: the sliders may
+    Sweeps every candidate site rather than replaying the selection: the sliders may
     have moved since, and a hook left behind on a block nobody is tracking any more
     would keep firing for the rest of the session.
     """
-    _force_pytorch_attention(False)
-
     if dit is None:
         return
 
+    adapter.force_pytorch_attention(dit, False)
     _hook_dit(dit, True)
 
-    for attn in _attention_modules(dit):
-        if attn is not None:
-            _hook_attention(attn, remove=True)
+    for site in [*adapter.block_sites(dit), *adapter.refiner_sites(dit)]:
+        _hook_attention(adapter, site, remove=True)
+
+
+__all__ = ["ROLE_BLOCK", "ROLE_REFINER", "active", "attention_bias", "patch_dit", "selected_blocks", "unpatch_dit"]

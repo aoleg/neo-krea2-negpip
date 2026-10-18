@@ -1,5 +1,5 @@
 """
-NegPiP for Krea 2 — shared constants.
+NegPiP for Krea 2 and MOSS-Image — shared constants.
 
 Copyright (C) 2025 hako-mikan (NegPiP)
 Copyright (C) 2026 blue-pen5805 (ComfyUI-krea2-negpip)
@@ -21,14 +21,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 from dataclasses import dataclass
 
-#   `type(shared.sd_model).__name__` for `backend/diffusion_engine/krea.py`
-KREA2_ENGINE = "Krea2"
-
-#   the Qwen3-VL tap stack Krea 2 conditioning carries: 12 layers x 2560 features,
-#   flattened into the 30720-wide `crossattn` the DiT unpacks in `_unpack_context`
-KREA2_TAP_LAYERS = 12
-KREA2_TAP_DIM = 2560
-
 #   `model_conds` keys -> extra kwargs on the diffusion-model forward
 NEGPIP_MASK_KEY = "c_negpip_mask"
 NEGPIP_BIAS_KEY = "c_negpip_bias"
@@ -37,11 +29,11 @@ NEGPIP_BIAS_KEY = "c_negpip_bias"
 NEGPIP_OPTION_KEY = "krea2_negpip_mask"
 NEGPIP_BIAS_OPTION_KEY = "krea2_negpip_bias"
 
-#   marks the `Attention` modules that are allowed to flip values
+#   marks the modules that are allowed to flip values
 NEGPIP_ROLE_ATTR = "_krea2_negpip_role"
 
 ROLE_BLOCK = "block"
-ROLE_REFINER = "txtfusion_refiner"
+ROLE_REFINER = "refiner"
 
 MAX_STRENGTH = 8.0
 MAX_GAIN = 8.0
@@ -59,6 +51,8 @@ class WeightConfig:
     renormalises the whole chunk's mean afterwards, so it is a poor lever for Krea 2: the
     text-fusion transformer's `RMSNorm` is scale-invariant, which leaves only the residual
     branch carrying any of the magnitude, and the sign does not survive `SwiGLU` at all.
+    MOSS-Image's text refiners put the same kind of norm between the conditioning and the
+    first attention, so the same holds there.
 
     Both replacements act inside attention instead, and each is a strict superset of doing
     nothing — a weight this config does not claim keeps going through the emphasis Forge
@@ -119,9 +113,6 @@ class WeightConfig:
 
 
 __all__ = [
-    "KREA2_ENGINE",
-    "KREA2_TAP_LAYERS",
-    "KREA2_TAP_DIM",
     "MAX_BIAS",
     "MAX_GAIN",
     "MAX_STRENGTH",

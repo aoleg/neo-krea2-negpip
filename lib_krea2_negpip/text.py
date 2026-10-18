@@ -1,30 +1,32 @@
 """
-Text-encoder side of Krea 2 NegPiP.
+Text-encoder side of NegPiP.
 
 Forge's emphasis pass multiplies the encoder's hidden states by the prompt weight, so a
 negative weight reaches the model as a sign-flipped *hidden state*.  On SD1/SDXL that is
 close enough to NegPiP — the conditioning is fed straight to `to_k`/`to_v`, both linear —
 but Krea 2 puts a two-stage text-fusion transformer between the conditioning and the
-first attention layer (`backend/nn/krea.py`, `TextFusionTransformer`).  RMSNorm and SwiGLU
-are not odd functions, so a negated Qwen3-VL tap stack is simply a different prompt, not
-an inverted one.
+first attention layer (`backend/nn/krea.py`, `TextFusionTransformer`), and MOSS-Image a
+projection and two text refiner blocks.  RMSNorm and SwiGLU are not odd functions, so a
+negated hidden state is simply a different prompt, not an inverted one.
 
 So a weight this extension claims is taken away from the emphasis pass entirely — it gets
 a flat `1.0` for those segments — and is handed to the diffusion model out of band, as two
-per-token rows applied inside attention after text fusion has run:
+per-token rows applied inside attention after the text has been through those stages:
 
 * a **value factor**, multiplied into the value vectors (`WeightConfig.value_factor`);
 * a **logit bias**, added to the attention scores (`WeightConfig.logit_bias`).
 
 A weight the config does not claim is left alone and reaches emphasis as itself, which is
-Forge's own behaviour; a negative one reaches it as `1.0`, since text fusion would eat the
-sign (§`_levers`).  See `dit.py` for the consuming end.
+Forge's own behaviour; a negative one reaches it as `1.0`, since the text stages would eat
+the sign (§`_levers`).  See `dit.py` for the consuming end.
 
-Since Forge Neo `21886f41` (2026-09-30) that emphasis pass is this module's, not the
-engine's: `Qwen3VL4BEngine` has a read-only `EmphasisNone` and hands the prompt to the
-encoder as literal text, parentheses included.  `_encode_tokens` puts back what the
-engine did before that commit — the selected emphasis on the input embeddings — so an
-unclaimed weight still means what it did.
+Neither engine applies that emphasis itself any more: since Forge Neo `21886f41`
+(2026-09-30) Krea 2's `Qwen3VL4BEngine` has a read-only `EmphasisNone` and hands the prompt
+to the encoder as literal text, parentheses included, and the MOSS-Image extension never
+did otherwise.  So the encode is this module's, through the adapter: `Krea2Adapter.encode`
+puts back what the engine did before that commit — the selected emphasis on the input
+embeddings — and `MossAdapter.encode` applies the ComfyUI output lerp its encoder offers.
+Either way an unclaimed weight still means something.
 
 Both rows are built over the exact token stream the multipliers are built over, and sliced
 at the exact same template offset, so they cannot drift apart.
@@ -38,15 +40,14 @@ nothing but drive the levers.  When no offsets can be had, `_tokenize_joined` to
 each segment on its own and splices the pieces into one copy of the template: not
 byte-identical to the unweighted prompt at the segment seams, but free of the repeated
 boilerplate, which is the damage that matters.  The split encode is only ever used when
-one-pass encoding is switched off.
+one-pass encoding is switched off, and only on a model that ever had it (Krea 2).
+
+Everything model-specific — which engine, which template, whether it is stripped from the
+conditioning, how the stream is encoded — goes through a `ModelAdapter` (`adapters.py`).
 """
 
 from functools import wraps
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from backend.diffusion_engine.krea import Krea2
-    from backend.text_processing.krea2_engine import Qwen3VL4BEngine
+from typing import Any
 
 import torch
 
@@ -57,16 +58,10 @@ from modules.processing import logger
 from modules.shared import opts
 
 from lib_krea2_negpip import NEGPIP_BIAS_KEY, NEGPIP_MASK_KEY, WeightConfig
+from lib_krea2_negpip.adapters import ModelAdapter
 from lib_krea2_negpip.prompts import weighted_segments
 
 ORIGINAL_ATTR = "_krea2_negpip_original_conditioning"
-
-#   `<|im_start|>`; the engine no longer exposes it as `id_template`
-ID_TEMPLATE = 151644
-
-#   `<|im_start|>user\n` — the three tokens the template strip steps over
-ID_USER = 872
-ID_NEWLINE = 198
 
 
 def _as_token_id(token) -> int | None:
@@ -74,51 +69,6 @@ def _as_token_id(token) -> int | None:
         return int(token)
     except TypeError:
         return None
-
-
-def _tokenizer(engine: "Qwen3VL4BEngine"):
-    """The Hugging Face tokenizer, which `21886f41` moved under an `SDTokenizer` wrapper."""
-    return engine.tokenizer.tokenizer
-
-
-def _templated_ids(engine: "Qwen3VL4BEngine", texts: list[str]) -> list[list[int]]:
-    """Each text stripped and wrapped in the whole chat template, one token list per text.
-
-    The engine's own `tokenize` no longer strips, and `__call__` only ever templates the
-    whole line, so the per-segment shape the split encode needs is built here.
-    """
-    return _tokenizer(engine)([engine.llama_template.format(text.strip()) for text in texts])["input_ids"]
-
-
-def _segment_text_span(engine: "Qwen3VL4BEngine", segment: list) -> tuple[int, int]:
-    """`[start, end)` of the prompt fragment inside one templated segment.
-
-    The split encode wraps *every* weighted segment in the whole chat template, so a
-    prompt carrying weights tokenises to several copies of the template with the
-    fragments spliced between them.  Emphasis scales all of it — that was Forge's own
-    behaviour, and a weight this extension does not claim keeps it — but
-    scaling the system instruction is not what `(word:-1.0)` asks for.  Both rows are
-    confined to the fragment: everything between `<|im_start|>user\\n` and the
-    `<|im_end|>` that ends the user turn.
-
-    Falls back to the whole segment if the landmarks are not where the template puts
-    them, which is also what happens for a prompt already written as raw chat markup.
-    """
-    starts = [i for i, token in enumerate(segment) if _as_token_id(token) == ID_TEMPLATE]
-    if len(starts) < 3:
-        return 0, len(segment)
-
-    user = starts[1]
-    if _as_token_id(segment[user + 1]) != ID_USER or _as_token_id(segment[user + 2]) != ID_NEWLINE:
-        return 0, len(segment)
-
-    start = user + 3
-    end = starts[2] - 2  # the `<|im_end|>\n` that closes the user turn
-
-    if not 0 <= start <= end <= len(segment):
-        return 0, len(segment)
-
-    return start, end
 
 
 def _levers(config: WeightConfig, weight: float) -> tuple[float, float, float]:
@@ -138,20 +88,25 @@ def _levers(config: WeightConfig, weight: float) -> tuple[float, float, float]:
     return (1.0 if claimed or weight < 0.0 else weight), factor, bias
 
 
-def _tokenize_segmented(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
+def _neutral(tokens: list) -> tuple[list, list[float], list[float], list[float]]:
+    """A stream no weight touches: the multipliers and factors `1.0`, the biases `0.0`."""
+    return list(tokens), [1.0] * len(tokens), [1.0] * len(tokens), [0.0] * len(tokens)
+
+
+def _tokenize_segmented(adapter: ModelAdapter, parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]]:
     """The pre-`21886f41` `tokenize_line`, with the claimed weights split off.
 
     Forge's own shape until that commit: every weighted segment is tokenised in its own
     copy of the whole chat template, so the emphasis multiplier covers the boilerplate too.  Our rows are
-    confined to the fragment (§`_segment_text_span`), but the extra template copies are
-    still in the conditioning.  `_tokenize_single` is the way out of that; this stays as
-    the fallback, and as the behaviour for anyone who leaves the option off.
+    confined to the fragment (§`Krea2Adapter.segment_text_span`), but the extra template
+    copies are still in the conditioning.  `_tokenize_single` is the way out of that; this
+    stays as the fallback, and as the behaviour for anyone who leaves the option off.
 
     Krea 2 conditioning in Forge never carries images — `Krea2.get_learned_conditioning`
     calls the engine with the text only — so the image-placeholder branch of the original
     has no counterpart here.
     """
-    tokenized = _templated_ids(engine, [text for text, _ in parsed])
+    tokenized = adapter.templated_ids([text for text, _ in parsed])
 
     tokens: list = []
     multipliers: list[float] = []
@@ -161,7 +116,7 @@ def _tokenize_segmented(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float
     for segment, (_, weight) in zip(tokenized, parsed):
         multiplier, factor, bias = _levers(config, weight)
         claimed = factor != 1.0 or bias != 0.0
-        start, end = _segment_text_span(engine, segment) if claimed else (0, 0)
+        start, end = adapter.segment_text_span(segment) if claimed else (0, 0)
 
         for i, token in enumerate(segment):
             inside = start <= i < end
@@ -173,48 +128,54 @@ def _tokenize_segmented(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float
     return tokens, multipliers, factors, biases
 
 
-def _token_owners(offsets: list[tuple[int, int]], bounds: list[tuple[int, int]]) -> list[int | None]:
+def _token_owners(offsets: list[tuple[int, int]], bounds: list[tuple[int, int]], text: str) -> list[int | None]:
     """Which parsed segment each token belongs to, by majority of its characters.
 
     A token can straddle a segment boundary — `(blurry:-1.0), sharp` leaves `blurry` and
     `,` adjacent with nothing between them, and a BPE merge across that seam is ordinary.
-    Whoever owns most of the token's text owns the token; ties go to the earlier segment,
-    so the rule is deterministic and never gives one token two weights.
+    Whoever owns most of the token's text owns the token, counting the characters that
+    are not whitespace first: Qwen's BPE carries the space *before* a word inside the
+    word's token, so `, (a red apple:-1.0)` puts the space of ` a` in the unweighted
+    segment and the `a` in the weighted one, and by plain character count the one-letter
+    word would be a tie and go to the wrong side.  What is left tied goes to the earlier
+    segment, so the rule is deterministic and never gives one token two weights.
     """
     owners: list[int | None] = []
 
     for start, end in offsets:
-        best, overlap = None, 0
+        best, score = None, (0, 0)
 
         for index, (low, high) in enumerate(bounds):
-            shared = min(end, high) - max(start, low)
-            if shared > overlap:
-                best, overlap = index, shared
+            lo, hi = max(start, low), min(end, high)
+            shared = hi - lo
+            if shared <= 0:
+                continue
+
+            candidate = (shared - sum(1 for c in text[lo:hi] if c.isspace()), shared)
+            if candidate > score:
+                best, score = index, candidate
 
         owners.append(best)
 
     return owners
 
 
-def _reported_offsets(engine: "Qwen3VL4BEngine", templated: str, tokens: list) -> list[tuple[int, int]] | None:
+def _reported_offsets(adapter: ModelAdapter, templated: str, tokens: list) -> list[tuple[int, int]] | None:
     """Character spans straight from the tokenizer, for the fast ones that report them."""
-    try:
-        encoded = _tokenizer(engine)([templated], return_offsets_mapping=True)
-    except (NotImplementedError, TypeError, ValueError):
+    reported = adapter.reported_offsets(templated)
+    if reported is None:
         return None
 
-    offsets = encoded.get("offset_mapping") if hasattr(encoded, "get") else None
-    if not offsets:
-        return None
+    ids, offsets = reported
 
     try:
         #   the token stream still comes from the engine; this only has to agree with it
-        if [int(token) for token in encoded["input_ids"][0]] != [int(token) for token in tokens]:
+        if [int(token) for token in ids] != [int(token) for token in tokens]:
             return None
     except (TypeError, ValueError):
         return None
 
-    return [tuple(span) for span in offsets[0]]
+    return [tuple(span) for span in offsets]
 
 
 def _decoded_offsets(tokenizer, tokens: list, templated: str) -> list[tuple[int, int]] | None:
@@ -258,7 +219,7 @@ def _decoded_offsets(tokenizer, tokens: list, templated: str) -> list[tuple[int,
     return offsets if cursor == len(templated) else None
 
 
-def _tokenize_single(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]], config: WeightConfig):
+def _tokenize_single(adapter: ModelAdapter, parsed: list[tuple[str, float]], config: WeightConfig):
     """The weighted prompt as **one** templated encode, or `None` if that isn't possible.
 
     `parse_prompt_attention` splits the prompt before the encoder ever sees it, and the
@@ -268,23 +229,23 @@ def _tokenize_single(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
     attention levers, which is what they were supposed to do.
 
     Localisation is by character offsets: reported by the tokenizer where it can
-    (`_reported_offsets`), decoded back out of the token stream where it cannot
-    (`_decoded_offsets`), which on Forge Neo's pinned `transformers` is the Krea 2 case
-    and therefore the one that matters.  Both are checked against the templated token
+    (`_reported_offsets`, which is MOSS-Image's fast tokenizer), decoded back out of the
+    token stream where it cannot (`_decoded_offsets`, which on Forge Neo's pinned
+    `transformers` is the Krea 2 case).  Both are checked against the templated token
     stream before they are used, and if neither can produce spans the caller falls back to
-    `_tokenize_segmented` — a real tested encoder rather than a guess.
+    `_tokenize_joined` — a real tested encoder rather than a guess.
     """
     clean = "".join(text for text, _ in parsed)
     stripped = clean.strip()
     lead = len(clean) - len(clean.lstrip())
 
-    prefix, _, _ = engine.llama_template.partition("{}")
-    tokens = _templated_ids(engine, [clean])[0]
-    templated = engine.llama_template.format(stripped)
+    prefix, _, _ = adapter.template.partition("{}")
+    tokens = adapter.templated_ids([clean])[0]
+    templated = adapter.template.format(stripped)
 
-    offsets = _reported_offsets(engine, templated, tokens)
+    offsets = _reported_offsets(adapter, templated, tokens)
     if offsets is None:
-        offsets = _decoded_offsets(_tokenizer(engine), tokens, templated)
+        offsets = _decoded_offsets(adapter.hf_tokenizer, tokens, templated)
     if offsets is None or len(offsets) != len(tokens):
         return None
 
@@ -302,7 +263,7 @@ def _tokenize_single(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
     factors = [1.0] * len(tokens)
     biases = [0.0] * len(tokens)
 
-    for i, owner in enumerate(_token_owners(offsets, bounds)):
+    for i, owner in enumerate(_token_owners(offsets, bounds, templated)):
         if owner is None:
             continue
         multipliers[i], factors[i], biases[i] = levers[owner]
@@ -310,7 +271,7 @@ def _tokenize_single(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
     return tokens, multipliers, factors, biases
 
 
-def _tokenize_joined(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]] | None:
+def _tokenize_joined(adapter: ModelAdapter, parsed: list[tuple[str, float]], config: WeightConfig) -> tuple[list, list[float], list[float], list[float]] | None:
     """Each segment tokenised on its own, spliced into **one** copy of the chat template.
 
     The fallback for `_tokenize_single` when neither offset source can place the
@@ -319,16 +280,20 @@ def _tokenize_joined(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
     `prefix + seg_1 + ... + seg_n + suffix` by construction.
 
     What it gives up against `_tokenize_single` is byte-identity with the unweighted
-    prompt: a BPE merge that would have crossed a segment seam cannot happen, and a
-    segment's leading space is tokenised at the start of a string rather than mid-sentence.
-    A handful of tokens differ at each seam; the sentence is otherwise the sentence, and
-    the template appears once.  The split encode would repeat the system instruction per
+    prompt: a BPE merge that would have crossed a segment seam cannot happen, so a token
+    or two can differ at each seam.  The sentence is otherwise the sentence, and the
+    template appears once.  The split encode would repeat the system instruction per
     segment, which is the damage that matters.
 
     The outer ends are stripped because the engine strips the whole prompt before
-    formatting it; interior whitespace belongs to whichever segment carries it.
+    formatting it.  Interior whitespace moves to the *start* of the segment that follows
+    it (flyfront's fix): Qwen's BPE merges a leading space into the word — `red` inside a
+    sentence is the single token `Ġred` — so a segment that ends in a space and one that
+    starts without it would both tokenise differently from the whole prompt, and the
+    weight would miss the space-carrying token.  Moved, the segment tokenises as it does
+    in the sentence and the weight covers the whole word.
     """
-    prefix, placeholder, suffix = engine.llama_template.partition("{}")
+    prefix, placeholder, suffix = adapter.template.partition("{}")
     if not placeholder:
         return None
 
@@ -337,8 +302,13 @@ def _tokenize_joined(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
         texts[0] = texts[0].lstrip()
         texts[-1] = texts[-1].rstrip()
 
+    for i in range(len(texts) - 1):
+        kept = texts[i].rstrip()
+        texts[i + 1] = texts[i][len(kept) :] + texts[i + 1]
+        texts[i] = kept
+
     try:
-        encoded = _tokenizer(engine)([prefix, *texts, suffix])["input_ids"]
+        encoded = adapter.raw_ids([prefix, *texts, suffix])
     except (TypeError, ValueError, KeyError):
         return None
     if len(encoded) != len(texts) + 2:
@@ -365,58 +335,61 @@ def _tokenize_joined(engine: "Qwen3VL4BEngine", parsed: list[tuple[str, float]],
     return tokens, multipliers, factors, biases
 
 
-def _tokenize_line(engine: "Qwen3VL4BEngine", line: str, config: WeightConfig, emphasis_name: str) -> tuple[list, list[float], list[float], list[float]]:
+def _tokenize_line(adapter: ModelAdapter, line: str, config: WeightConfig, emphasis_name: str) -> tuple[list, list[float], list[float], list[float]]:
     """One prompt line -> the token stream plus the three rows indexed by it."""
-    global _warned_single_pass, _warned_joined
+    global _warned_single_pass, _warned_joined, _warned_split
+
+    #   a line the model reads as data (a MOSS-Image layout) never meets the parser, whose
+    #   square brackets would turn a bounding box into de-emphasis; it is the engine's own
+    #   stream with neutral rows
+    if adapter.is_verbatim(line):
+        return _neutral(adapter.plain_ids(line))
 
     parsed = weighted_segments(line, emphasis_name)
 
-    if config.single_pass:
-        single = _tokenize_single(engine, parsed, config)
-        if single is not None:
-            return single
+    if all(weight == 1.0 for _, weight in parsed):
+        #   an engine that can hand over its own ids for an unweighted line does, so the
+        #   conditioning is its own to the byte; Krea 2 builds the stream like any other
+        plain = adapter.plain_ids(line)
+        if plain is not None:
+            return _neutral(plain)
 
-        joined = _tokenize_joined(engine, parsed, config)
-        if joined is not None:
-            #   the infotext records the option, not which path produced the stream; a
-            #   seam-level difference from the exact path is worth one line in the log
-            if not _warned_joined:
+    single_pass = config.single_pass
+    if not single_pass and not adapter.split_encode:
+        #   the infotext records the option; a model that never had the split encode has
+        #   nothing for "off" to mean, which is worth one line rather than a silent "on"
+        if not _warned_split:
+            _warned_split = True
+            logger.info(f"NegPiP: {adapter.name} has no split encoding; the prompt is encoded in one pass regardless of the option")
+        single_pass = True
+
+    stream = None
+
+    if single_pass:
+        stream = _tokenize_single(adapter, parsed, config)
+
+        if stream is None:
+            stream = _tokenize_joined(adapter, parsed, config)
+            if stream is not None and not _warned_joined:
+                #   the infotext records the option, not which path produced the stream; a
+                #   seam-level difference from the exact path is worth one line in the log
                 _warned_joined = True
                 logger.info("NegPiP: cannot locate the prompt fragments by character offset; tokenising the segments separately inside one chat template instead")
-            return joined
 
-        #   the infotext records the option, not whether it engaged, so an unannounced
-        #   fallback here reads afterwards as "one pass was on and made no difference"
-        if not _warned_single_pass:
+        if stream is None and not _warned_single_pass:
+            #   the infotext records the option, not whether it engaged, so an unannounced
+            #   fallback here reads afterwards as "one pass was on and made no difference"
             _warned_single_pass = True
             logger.warning("NegPiP: cannot tokenise the prompt in one pass; falling back to the split encoding for this prompt")
 
-    return _tokenize_segmented(engine, parsed, config)
+    if stream is None:
+        stream = _tokenize_segmented(adapter, parsed, config)
 
+    if adapter.max_length is not None:
+        #   the engine truncates its own stream; the rows have to be cut where it cuts
+        stream = tuple(row[: adapter.max_length] for row in stream)
 
-def _template_end(engine: "Qwen3VL4BEngine", tokens: list, seq_len: int) -> int:
-    """The offset `Qwen3VL4BEngine.__call__` slices the template off at, computed alone.
-
-    The engine does it inline over its own token stream, so there is nothing to call.
-    """
-    template_end = 0
-    count_im_start = 0
-
-    for i, token in enumerate(tokens):
-        try:
-            elem = int(token)
-        except TypeError:
-            continue
-
-        if elem == ID_TEMPLATE and count_im_start < 2:
-            template_end = i
-            count_im_start += 1
-
-    if seq_len > (template_end + 3):
-        if int(tokens[template_end + 1]) == ID_USER and int(tokens[template_end + 2]) == ID_NEWLINE:
-            template_end += 3
-
-    return template_end
+    return stream
 
 
 def _row(values: list[float], seq: int, default: float) -> list[float]:
@@ -425,47 +398,13 @@ def _row(values: list[float], seq: int, default: float) -> list[float]:
     return row + [default] * (seq - len(row))
 
 
-def _encode_tokens(engine: "Qwen3VL4BEngine", tokens: list, multipliers: list[float], weighting: emphasis.Emphasis) -> torch.Tensor:
-    """`SDClipModel.forward` for one line, with the emphasis pass put back in.
-
-    Before `21886f41` the engine applied the selected emphasis to the input embeddings,
-    between building them and running the transformer; `SDClipModel.forward` has no step
-    there, so this is that forward with the step restored.  All-`1.0` multipliers skip it,
-    which `EmphasisOriginal` makes an exact identity anyway, so an unweighted line is
-    encoded exactly as the engine encodes it.
-    """
-    encoder = engine.text_encoder
-    device = encoder.transformer.get_input_embeddings().weight.device
-
-    embeds, mask, num_tokens, embeds_info = encoder.process_tokens([tokens], device)
-
-    #   images would make the lengths differ; Forge skipped emphasis then, and so does this
-    if embeds.shape[1] == len(multipliers) and any(m != 1.0 for m in multipliers):
-        weighted = weighting(embeds, torch.asarray([multipliers]).to(embeds))
-        if weighted is not None:  # `EmphasisNone` and `EmphasisIgnore` return nothing
-            embeds = weighted
-
-    outputs = encoder.transformer(
-        None,
-        mask if encoder.enable_attention_masks else None,
-        embeds=embeds,
-        num_tokens=num_tokens,
-        intermediate_output=encoder.layer,  # the tap list; Krea 2 never uses "last"
-        final_layer_norm_intermediate=encoder.layer_norm_hidden_state,
-        dtype=torch.float32,
-        embeds_info=embeds_info,
-    )
-
-    return outputs[1].float().to(device=memory_management.intermediate_device())  # (1, taps, seq, dim)
-
-
-def _encode_line(engine: "Qwen3VL4BEngine", line: str, config: WeightConfig, weighting: emphasis.Emphasis) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+def _encode_line(adapter: ModelAdapter, line: str, config: WeightConfig, weighting: emphasis.Emphasis) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """One prompt line -> `(conditioning, value factors, logit biases, claimed tokens)`."""
-    tokens, multipliers, factors, biases = _tokenize_line(engine, line, config, weighting.name)
+    tokens, multipliers, factors, biases = _tokenize_line(adapter, line, config, weighting.name)
 
     global _warned_expanded
 
-    z = _encode_tokens(engine, tokens, multipliers, weighting)
+    z = adapter.encode(line, tokens, multipliers, weighting)  # token axis first, template on
 
     #   a token is not always one sequence position: `process_tokens` splices an embedding
     #   in over several, so a row indexed by *token* stops describing the conditioning.
@@ -474,52 +413,35 @@ def _encode_line(engine: "Qwen3VL4BEngine", line: str, config: WeightConfig, wei
     #   disagree.  Unreachable today — only the image path makes non-integer tokens, and
     #   that path is handed back to Forge whole — but silently misplacing a sign flip is
     #   not a failure worth leaving unguarded.
-    aligned = int(z.shape[2]) == len(tokens)
+    aligned = int(z.shape[0]) == len(tokens)
     if not aligned and not _warned_expanded:
         _warned_expanded = True
         logger.warning("NegPiP: the encoder expanded the token stream, so the weights cannot be placed; leaving this prompt alone")
 
-    template_end = _template_end(engine, tokens, z.shape[2])
-    z = z[:, :, template_end:]
+    template_end = adapter.template_end(tokens, int(z.shape[0]))
+    z = z[template_end:]
 
-    batch, taps, seq, dim = z.shape
-
-    #   `Qwen3VL4BEngine.__call__` puts the *token* axis first, which is the shape
-    #   `SingleStreamDiT.txtfusion` reads.  One line at a time, so `batch` is 1 and the
-    #   leading axis is the token count.
-    z = z.permute(0, 2, 1, 3).reshape(batch * seq, taps, dim)
+    seq = int(z.shape[0])
 
     visible_factors = _row(factors[template_end:], seq, 1.0) if aligned else [1.0] * seq
     visible_biases = _row(biases[template_end:], seq, 0.0) if aligned else [0.0] * seq
 
     def column(values: list[float]) -> torch.Tensor:
         #   indexed 1:1 with the conditioning's leading axis, so Forge's own batching and
-        #   scheduling code keeps the two together without any realignment of ours
-        return torch.tensor(values, device=z.device, dtype=z.dtype).reshape(batch * seq, 1, 1)
+        #   scheduling code keeps the two together without any realignment of ours; the
+        #   trailing singleton axes make it batch like the conditioning it rides with
+        return torch.tensor(values, device=z.device, dtype=z.dtype).reshape(seq, *([1] * (z.ndim - 1)))
 
     count = sum(1 for factor, bias in zip(visible_factors, visible_biases) if factor != 1.0 or bias != 0.0)
 
     return z, column(visible_factors), column(visible_biases), count
 
 
-_warned_reference = False
+_warned_hand_back = False
 _warned_expanded = False
 _warned_single_pass = False
 _warned_joined = False
-
-
-def _reference_active(model: "Krea2", prompt) -> bool:
-    """Whether `Krea2.get_learned_conditioning` would take its reference-image branch.
-
-    Read-only — the original consumes `ini_latent` and clears `ref_latents` itself, and
-    doing that here as well would eat the state before Forge ever sees it.
-    """
-    if getattr(prompt, "is_negative_prompt", False):
-        return False
-    if not getattr(opts, "krea2_do_reference", False):
-        return False
-
-    return bool(getattr(model, "ref_latents", None)) or getattr(model, "ini_latent", None) is not None
+_warned_split = False
 
 
 def _report(prompt, count: int):
@@ -530,8 +452,8 @@ def _report(prompt, count: int):
     logger.info(f"NegPiP Enable ({key}: {count})")
 
 
-def patch_text_encoder(model: "Krea2", config: WeightConfig):
-    """Replace `Krea2.get_learned_conditioning` with the row-producing version.
+def patch_text_encoder(adapter: ModelAdapter, config: WeightConfig):
+    """Replace the engine's `get_learned_conditioning` with the row-producing version.
 
     The result is a `dict` of *lists* rather than stacked tensors: prompt scheduling
     (`[a:b:0.5]`) hands the engine several lines of different token counts in one call,
@@ -540,42 +462,36 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
 
     Which keys the dict carries follows the *config*, not this batch's prompts, so cond
     and uncond always agree on the shape even when only one of them uses a lever.  A
-    config with neither lever returns the bare list, the shape Forge's own engine returns:
+    config with neither lever returns the bare list, the shape the engine itself returns:
     that is the batch where only emphasis is needed.
     """
+    model: Any = adapter.model
+
     if getattr(model, ORIGINAL_ATTR, None) is not None:
         return
 
     original = model.get_learned_conditioning
-    engine: "Qwen3VL4BEngine" = model.text_processing_engine_qwen
 
     @torch.inference_mode()
     @wraps(original)
     def negpip_get_learned_conditioning(prompt):
-        global _warned_reference
+        global _warned_hand_back
 
-        if _reference_active(model, prompt):
-            #   Krea 2 Edit encodes the prompt alongside reference images, on a path that
-            #   carries no per-token rows.  Hand the whole call back rather than half-apply
-            #   it, and say so — silently dropping the weights is how this went unnoticed
-            #   the last time the framework moved underneath the extension.
-            if not _warned_reference:
-                _warned_reference = True
-                logger.warning("NegPiP does not apply to the Krea 2 reference/Edit path; the positive prompt's weights are ignored there")
+        reason = adapter.hand_back(prompt)
+        if reason is not None:
+            #   hand the whole call back rather than half-apply it, and say so — silently
+            #   dropping the weights is how this went unnoticed the last time the framework
+            #   moved underneath the extension
+            if not _warned_hand_back:
+                _warned_hand_back = True
+                logger.warning(reason)
             return original(prompt)
 
         memory_management.load_model_gpu(model.forge_objects.clip.patcher)
+        adapter.before_encode(prompt)
 
-        if not getattr(prompt, "is_negative_prompt", False):
-            #   the bookkeeping `Krea2.get_learned_conditioning` does before encoding, and
-            #   which this replaces: the img2img latent is consumed and the reference list
-            #   dropped, so a stale one cannot put the DiT into edit mode
-            if hasattr(model, "ini_latent"):
-                model.ini_latent = None
-            dynamic_args.ref_latents.clear()
-
-        #   the engine's own `emphasis` is a read-only `EmphasisNone` since `21886f41`; the
-        #   setting is read here, as the engine read it before
+        #   neither engine reads the setting any more; it is read here, as the engines did
+        #   before, and recorded under the name Forge records it
         weighting = emphasis.get_current_option(opts.emphasis)()
         if any(emphasis.uses_emphasis(line) for line in prompt):
             dynamic_args.last_extra_generation_params["Emphasis"] = weighting.name
@@ -589,7 +505,7 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
         for line in prompt:
             encoded = cache.get(line)
             if encoded is None:
-                encoded = _encode_line(engine, line, config, weighting)
+                encoded = _encode_line(adapter, line, config, weighting)
                 cache[line] = encoded
 
             z, mask, bias, claimed = encoded
@@ -601,8 +517,8 @@ def patch_text_encoder(model: "Krea2", config: WeightConfig):
         _report(prompt, count)
 
         if not (config.uses_value or config.uses_bias):
-            #   emphasis only: Forge's own shape, so the DiT and `compile_conditions` need
-            #   no hooks at all
+            #   emphasis only: the engine's own shape, so the DiT and `compile_conditions`
+            #   need no hooks at all
             return conds
 
         result = {"crossattn": conds}

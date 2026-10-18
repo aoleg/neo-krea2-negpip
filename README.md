@@ -1,6 +1,6 @@
-# Neo Krea 2 NegPiP
+# NegPiP for Krea 2 and MOSS-Image
 
-A **Forge Neo** extension that lets you put negative prompting *inside* your prompt, for **Krea 2**.
+A **Forge Neo** extension that lets you put negative prompting *inside* your prompt, for **Krea 2** and **MOSS-Image**.
 
 Give a word a negative weight and the model subtracts it instead of emphasising it:
 
@@ -16,7 +16,7 @@ It works in either field:
 - `(aqua hair:-1.0)` in the **negative** prompt *enforces* it instead — a double negative
 
 > [!NOTE]
-> **Krea 2 only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle.
+> **Krea 2 and MOSS-Image only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle. MOSS-Image is not part of Forge Neo: it comes from the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension (0.1.x), which has to be installed and enabled for the MOSS-Image side of this one to have anything to hook. See [MOSS-Image](#moss-image) for what differs there.
 
 ## Install
 
@@ -36,10 +36,12 @@ No extra dependencies.
 
 Needs Forge Neo from 2026-09-30 (commit `21886f41`, which rewrote the text encoders) or later. On an older Forge Neo, update Forge, or check out commit `8e283b1` of this extension.
 
+The panel used to be titled *NegPiP (Krea 2)*. The title is also the key your `ui-config.json` stores panel defaults under, so a default you saved there (for example *Enable* on) has to be set again once.
+
 ## Quick start
 
-1. Load a Krea 2 checkpoint.
-2. Open the **NegPiP (Krea 2)** panel and tick it on.
+1. Load a Krea 2 or MOSS-Image checkpoint.
+2. Open the **NegPiP (Krea 2 / MOSS-Image)** panel and tick it on.
 3. Put a negative weight in either prompt field and generate.
 
 The console confirms it took effect, with the number of words affected:
@@ -48,9 +50,11 @@ The console confirms it took effect, with the number of words affected:
 NegPiP Enable (Positive: 3)
 ```
 
-Nothing happens unless a prompt contains a weight, so it is safe to leave switched on all the time. On current Forge Neo you want it on for any weighted Krea 2 prompt: since 2026-09-30 Forge reads `(word:1.2)` as literal text, brackets included, and this extension is what turns it back into a weight.
+Nothing happens unless a prompt contains a weight, so it is safe to leave switched on all the time. On current Forge Neo you want it on for any weighted prompt on either model: since 2026-09-30 Forge reads `(word:1.2)` on Krea 2 as literal text, brackets included, the MOSS-Image extension has always done the same, and this extension is what turns it back into a weight.
 
 ## What it looks like
+
+Everything below is Krea 2. The mechanism is the same on MOSS-Image, but no sheets have been made for it yet; see [MOSS-Image](#moss-image) for what to expect there.
 
 Everything below is one seed (42) on a Krea 2 int8 checkpoint with the Turbo LoRA at 0.6, Euler a, 12 steps, CFG 1, 1536×1536, Emphasis set to *No norm*. Nothing changes between the panels of a sheet except what the caption says.
 
@@ -191,18 +195,45 @@ If the tokenizer cannot say where each fragment landed, the extension tokenises 
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Also act inside the text-fusion refiners | off | Applies the effect one stage earlier, before the image has read the text at all. Noticeably stronger and harder to steer — reach for it when a stubborn concept survives everything else. |
-| First block / Last block | `0` / `27` | Which part of the model is affected, out of 28 stages. Narrowing the range weakens the effect and changes its character: as a rule of thumb the early stages shape composition and layout, the later ones texture and detail. Restricting to late blocks can remove a *look* while leaving the arrangement of the image alone. |
+| Also act inside the text refiners | off | Applies the effect one stage earlier, before the image has read the text at all: Krea 2's text-fusion refiners, MOSS-Image's two text blocks. Noticeably stronger and harder to steer — reach for it when a stubborn concept survives everything else. |
+| First block / Last block | `0` / `41` | Which part of the model is affected, out of 28 stages on Krea 2 and 42 on MOSS-Image; the range is clamped to the loaded model, so the default covers all of either. Narrowing the range weakens the effect and changes its character: as a rule of thumb the early stages shape composition and layout, the later ones texture and detail. Restricting to late blocks can remove a *look* while leaving the arrangement of the image alone. |
 | Block stride | `1` | Apply in every Nth stage instead of all of them. Another way to soften the effect while keeping it spread across the whole model. |
 
-All settings are saved into the image's generation parameters and paste back from them.
+All settings are saved into the image's generation parameters and paste back from them. They are written as `NegPiP ...` entries; images made while Krea 2 was the only model carry `Krea2 NegPiP ...` entries, which paste back the same way.
+
+## MOSS-Image
+
+MOSS-Image reaches Forge Neo through the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension, which hands the prompt to its Qwen3.5 text encoder verbatim — `(blue theme:2.0)` arrives as text, brackets and number included, and the room comes out red with *Blue Theme* written on the wall. With this extension on, the same panel and the same settings apply, and the levers do what they do on Krea 2: a negative weight flips the word's contribution inside each of the 42 blocks, weights above `1` raise how much the image attends to the word. A few things are different, all of them following the model:
+
+- **The whole chat template is in the conditioning.** The MOSS-Image DiT reads every token of the templated prompt, template included, so there is nothing to strip and the weights cover exactly the words you wrote. The text sits at the *end* of the model's joint sequence rather than the start; the extension puts the rows there.
+- **One pass, always.** The MOSS-Image extension never encoded a weighted prompt segment by segment, so **Encode the prompt in one pass** has nothing to switch off there. The option is recorded as you set it and the console says once that it was ignored.
+- **Ordinary emphasis is ComfyUI's.** A weight this extension does not claim — `(word:0.8)` with **Handle de-emphasis too** off, or `(word:1.5)` with both emphasis levers off — is applied the way ComfyUI applies prompt weights to this model: the word's encoding is moved towards an empty encoding by the weight. Settings → *Emphasis* still decides whether weights are parsed at all (`None`, `Ignore`), but *Original* and *No norm* both mean that lerp here.
+- **Layout prompts pass through untouched.** A layout — the whole prompt as one JSON object, as written by hand or by [Regional Boxes](https://github.com/eduardoabreu81/sd-regional-boxes-neo), with or without the braces sd-dynamic-prompts strips — is data, not a prompt with weights in it. Its `[top, left, bottom, right]` boxes would otherwise be read as de-emphasis. Such a prompt is encoded exactly as the MOSS-Image extension encodes it, and a layout alone never switches the extension on.
+- **`BREAK` is a plain word**, as it is for the MOSS-Image extension; with weights in the prompt it stays one.
+- **The negative-pass block skip keeps working.** The MOSS-Image extension's *Blocks skipped in the negative-prompt pass* setting is honoured under the hooks.
+- **It only hooks what it recognises.** The MOSS-Image extension is third-party and at 0.1.x. If its engine or DiT is not shaped the way this extension expects — the wrong number of blocks, a missing projection, a renamed attention — NegPiP stands down and the console says exactly what it was looking for: `NegPiP stands down on MOSS-Image: ...`. Forge and the MOSS-Image extension keep working.
+
+Suggested first tests, both on the SFT model (`moss_image_sft_int8_convrot`), Euler, the MOSS schedule, 20 steps, CFG 3, one seed, after [flyfront's](https://github.com/flyfront/sd-forge-negpip) MOSS-Image examples:
+
+```text
+a cute cat sitting on a sofa in a living room, (a red apple:-1.0) on the table
+```
+
+against the same prompt with `a red apple on the table` — the apple should go and the rest stay — and
+
+```text
+a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
+```
+
+against `red theme, blue theme` — the room should turn towards blue, where with the extension off it stays red and may letter the weight on the wall. The console should print `NegPiP Enable (Positive: 3)` for the first (three tokens: `a`, `red`, `apple`) and `NegPiP Enable (Positive: 2)` for the second.
 
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
 - **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if **Handle emphasis in attention** has been switched off.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
-- **Is the checkpoint Krea 2?** It deliberately does nothing on other models.
+- **Is the checkpoint Krea 2 or MOSS-Image?** It deliberately does nothing on other models.
+- **On MOSS-Image, is the prompt a layout?** A JSON layout is passed through as data, weights and all; see [MOSS-Image](#moss-image). And look for a `NegPiP stands down on MOSS-Image:` line, which names the part of the MOSS-Image extension that did not look the way this one expects.
 
 ## If a negative weight softens the whole image
 
@@ -217,19 +248,20 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
-- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply, as set in Settings → *Emphasis*. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, Forge reads the brackets as text.
+- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text; the MOSS-Image extension always did. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply on Krea 2, as set in Settings → *Emphasis*, and ComfyUI's weighting on MOSS-Image. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, the brackets are read as text.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works
 
-See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the implementation: why the existing Forge NegPiP port does not cover Krea 2, how the weights reach the model, and how it is tested.
+See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the implementation: why the existing Forge NegPiP port does not cover these models, how the weights reach each of them, and how it is tested.
 
 ## Credits
 
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip) — NegPiP itself.
 - [blue-pen5805](https://github.com/blue-pen5805/ComfyUI-krea2-negpip) — the Krea 2 ComfyUI node this is a port of.
 - [Haoming02](https://github.com/Haoming02/sd-webui-forge-classic) — Forge Neo, and the [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) port that mapped out how NegPiP fits into it.
-- [flyfront](https://github.com/flyfront/sd-forge-negpip) — the per-segment one-pass tokenizer this uses as a fallback, and the case for value-side emphasis.
+- [flyfront](https://github.com/flyfront/sd-forge-negpip) — the per-segment one-pass tokenizer this uses as a fallback, the case for value-side emphasis, and the first NegPiP for MOSS-Image, whose `neo-moss` branch mapped out the MOSS-Image extension's engine, DiT and layout prompts.
+- [eduardoabreu81](https://github.com/eduardoabreu81/moss-image-forge-neo) — MOSS-Image for Forge Neo, the extension the MOSS-Image side of this one hooks.
 
 ## License
 
