@@ -16,7 +16,7 @@ It works in either field:
 - `(aqua hair:-1.0)` in the **negative** prompt *enforces* it instead — a double negative
 
 > [!NOTE]
-> **Krea 2 and MOSS-Image only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle. MOSS-Image is not part of Forge Neo: it comes from the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension (0.1.x), which has to be installed and enabled for the MOSS-Image side of this one to have anything to hook. See [MOSS-Image](#moss-image) for what differs there.
+> **Krea 2 and MOSS-Image only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle. MOSS-Image works on Forge Neo's own support (since 2026-10-21) and on the older [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension (0.1.x) alike; whichever loaded the model is detected. See [MOSS-Image](#moss-image) for what differs there.
 
 ## Install
 
@@ -248,7 +248,7 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
-- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text; the MOSS-Image extension always did. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply on Krea 2, as set in Settings → *Emphasis*, and ComfyUI's weighting on MOSS-Image. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, the brackets are read as text.
+- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text; MOSS-Image always did, in Forge and in the extension. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply on Krea 2, as set in Settings → *Emphasis*, and ComfyUI's weighting on MOSS-Image. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, the brackets are read as text.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works
@@ -260,8 +260,8 @@ See [HOW-IT-WORKS.md](HOW-IT-WORKS.md) for the implementation: why the existing 
 - [hako-mikan](https://github.com/hako-mikan/sd-webui-negpip) — NegPiP itself.
 - [blue-pen5805](https://github.com/blue-pen5805/ComfyUI-krea2-negpip) — the Krea 2 ComfyUI node this is a port of.
 - [Haoming02](https://github.com/Haoming02/sd-webui-forge-classic) — Forge Neo, and the [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) port that mapped out how NegPiP fits into it.
-- [flyfront](https://github.com/flyfront/sd-forge-negpip) — the per-segment one-pass tokenizer this uses as a fallback, the case for value-side emphasis, and the first NegPiP for MOSS-Image, whose `neo-moss` branch mapped out the MOSS-Image extension's engine, DiT and layout prompts.
-- [eduardoabreu81](https://github.com/eduardoabreu81/moss-image-forge-neo) — MOSS-Image for Forge Neo, the extension the MOSS-Image side of this one hooks.
+- [flyfront](https://github.com/flyfront/sd-forge-negpip) — the per-segment one-pass tokenizer this uses as a fallback, the case for value-side emphasis, and the first NegPiP for MOSS-Image, whose `neo-moss` and `neo` branches mapped out both MOSS-Image backends' engines, DiTs and layout prompts.
+- [eduardoabreu81](https://github.com/eduardoabreu81/moss-image-forge-neo) — MOSS-Image for Forge Neo before Forge had it, the extension this one still hooks when it is installed.
 
 ## License
 
