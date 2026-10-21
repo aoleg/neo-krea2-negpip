@@ -115,10 +115,12 @@ def _mean_value(text: torch.Tensor, m: torch.Tensor, amount: float) -> torch.Ten
     keep = (m == 1.0).to(torch.float32)
     denom = keep.sum(dim=1, keepdim=True)
 
+    #   decided on the device: reading the flag back to the host (`bool(empty.any())`)
+    #   would synchronise the stream in every hooked block on every step, and the GPU then
+    #   idles behind the Python dispatch loop, which showed up as sampling 1.4x slower
     empty = denom == 0
-    if bool(empty.any()):
-        keep = torch.where(empty, torch.ones_like(keep), keep)
-        denom = keep.sum(dim=1, keepdim=True)
+    keep = torch.where(empty, torch.ones_like(keep), keep)
+    denom = torch.where(empty, torch.full_like(denom, float(keep.shape[1])), denom)
 
     mean = (text.to(torch.float32) * keep).sum(dim=1, keepdim=True) / denom
     return (mean * amount).to(text.dtype)
@@ -346,9 +348,14 @@ def _hook_compile_conditions():
     `vector`.  NegPiP makes a third — `crossattn` plus the per-token rows, no pooled
     vector — and the stock function would raise `KeyError: 'vector'` on it.
 
-    A plain `Condition`, not `ConditionCrossAttn`: the rows are 1:1 with the conditioning
-    they describe, and `ConditionCrossAttn.concat` would repeat them to a common length
-    instead of refusing, which is exactly the misalignment worth failing loudly on.
+    The rows ride as `ConditionCrossAttn`, the class the conditioning itself rides as, and
+    for the same reason: when cond and uncond have different token counts Forge batches
+    them into one forward pass by repeating the shorter along the token axis up to the
+    lcm (`ConditionCrossAttn.concat`, when the multiple is at most 4), and a plain
+    `Condition` refuses to concat on any shape difference, which made every such batch
+    run cond and uncond as two passes while NegPiP was on.  Tiling the rows with the same
+    rule keeps them 1:1 with the tiled conditioning: position `i` of the repeated row is
+    the position `i` of the repeated tokens, by construction.
 
     Installed on demand and never removed.  Forge caches compiled conditioning on the
     `StableDiffusionProcessing` *class*, so a dict cond can outlive the run that made
@@ -368,7 +375,7 @@ def _hook_compile_conditions():
 
             for key in (NEGPIP_MASK_KEY, NEGPIP_BIAS_KEY):
                 if key in cond:
-                    model_conds[key] = condition.Condition(cond[key])
+                    model_conds[key] = condition.ConditionCrossAttn(cond[key])
 
             return [dict(cross_attn=cross_attn, model_conds=model_conds)]
 

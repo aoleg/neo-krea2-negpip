@@ -367,7 +367,27 @@ with torch.no_grad():
 negpip_dit._hook_compile_conditions()
 out = negpip([weighted], one_pass)
 compiled = condition.compile_conditions({"crossattn": out["crossattn"][0], NEGPIP_MASK_KEY: out[NEGPIP_MASK_KEY][0]})
-check("compile_conditions: crossattn + rows, no pooled vector", isinstance(compiled[0]["model_conds"]["c_crossattn"], condition.ConditionCrossAttn) and type(compiled[0]["model_conds"][NEGPIP_MASK_KEY]) is condition.Condition)
+check("compile_conditions: crossattn + rows as ConditionCrossAttn, no pooled vector", isinstance(compiled[0]["model_conds"]["c_crossattn"], condition.ConditionCrossAttn) and isinstance(compiled[0]["model_conds"][NEGPIP_MASK_KEY], condition.ConditionCrossAttn))
+
+# 12b. cond and uncond of different token counts batch into one pass, rows tiled like the tokens
+#   a 2:1 pair cut from the weighted prompt's own conditioning, so the tiling branch is the one exercised
+even = 2 * (out["crossattn"][0].shape[0] // 2)
+long_cond, long_rows = out["crossattn"][0][:even], out[NEGPIP_MASK_KEY][0][:even]
+short_cond, short_rows = long_cond[: even // 2], long_rows[: even // 2]
+pair_cond = (condition.ConditionCrossAttn(long_cond[None]), condition.ConditionCrossAttn(short_cond[None]))
+pair_rows = (condition.ConditionCrossAttn(long_rows[None]), condition.ConditionCrossAttn(short_rows[None]))
+check("batching: a plain Condition would refuse the pair, ConditionCrossAttn takes it", not condition.Condition(long_rows[None]).can_concat(condition.Condition(short_rows[None])) and pair_rows[0].can_concat(pair_rows[1]) == pair_cond[0].can_concat(pair_cond[1]))
+if pair_cond[0].can_concat(pair_cond[1]):
+    tiled_cond = pair_cond[0].concat([pair_cond[1]])
+    tiled_rows = pair_rows[0].concat([pair_rows[1]])
+    check("batching: rows tiled to the same length as the tokens", tiled_rows.shape[:2] == tiled_cond.shape[:2])
+    period = short_cond.shape[0]
+    flagged_long = [i for i, v in enumerate(long_rows.flatten().tolist()) if v != 1.0]
+    flagged_tiled = [i for i, v in enumerate(tiled_rows[0].flatten().tolist()) if v != 1.0]
+    tiles = tiled_cond.shape[1] // long_cond.shape[0]
+    check("batching: the long row's flags repeat with its tokens", flagged_tiled == [i + k * long_cond.shape[0] for k in range(tiles) for i in flagged_long] and torch.equal(tiled_cond[0, : long_cond.shape[0]], long_cond) and torch.equal(tiled_cond[1, :period], short_cond) and torch.equal(tiled_cond[1, period : 2 * period], short_cond))
+else:
+    check("batching: a 2:1 pair must be one Forge batches", False)
 
 # 13. the script: activation, a layout never activates, the builder's Extra does, infotext, a bad DiT stands down with a reason
 script_module = load_script()

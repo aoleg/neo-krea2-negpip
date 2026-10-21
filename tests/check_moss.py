@@ -347,7 +347,7 @@ with torch.no_grad():
 negpip_dit._hook_compile_conditions()
 out = negpip([weighted], one_pass)
 compiled = condition.compile_conditions({"crossattn": out["crossattn"][0], NEGPIP_MASK_KEY: out[NEGPIP_MASK_KEY][0]})
-check("compile_conditions: crossattn + rows, no pooled vector", isinstance(compiled[0]["model_conds"]["c_crossattn"], condition.ConditionCrossAttn) and type(compiled[0]["model_conds"][NEGPIP_MASK_KEY]) is condition.Condition)
+check("compile_conditions: crossattn + rows as ConditionCrossAttn, no pooled vector", isinstance(compiled[0]["model_conds"]["c_crossattn"], condition.ConditionCrossAttn) and isinstance(compiled[0]["model_conds"][NEGPIP_MASK_KEY], condition.ConditionCrossAttn))
 
 # 13. the script: activation, a layout never activates, infotext, a bad DiT stands down with a reason
 script_module = load_script()

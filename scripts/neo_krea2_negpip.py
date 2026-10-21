@@ -371,7 +371,12 @@ class NegPiP(scripts.Script):
         reset_prompt_cache(p)
         p.extra_generation_params.update(params)
 
-        logger.debug(f"NegPiP patched {hooked} attention modules on {adapter.name}{', SDPA forced' if options['force_pytorch_attention'] else ''}")
+        if options["force_pytorch_attention"]:
+            #   the one setting with a speed cost, said out loud: the optimised attention
+            #   backend cannot take the additive mask, so every attention in the model runs
+            #   on plain PyTorch SDPA for this batch
+            logger.info(f"NegPiP: a weight above 1 with 'Handle emphasis in attention' on; {adapter.name} attention runs on PyTorch SDPA for this batch, which is slower than the optimised backend")
+        logger.debug(f"NegPiP patched {hooked} attention modules on {adapter.name}")
 
     def postprocess(self, p, processed, *args):
         NegPiP._teardown()
