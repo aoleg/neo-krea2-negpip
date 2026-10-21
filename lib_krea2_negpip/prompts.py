@@ -41,6 +41,24 @@ def weighted_segments(line: str, emphasis_name: str) -> list[tuple[str, float]]:
     return segments
 
 
+def segments(adapter: ModelAdapter, line: str, emphasis_name: str) -> list[tuple[str, float]]:
+    """The line as `(text, weight)` segments, with the adapter's verbatim prefix in front.
+
+    A MOSS-Image layout is data the model reads as it stands, and its square brackets
+    would be de-emphasis to the parser, so it goes in as one segment at `1.0` and only
+    what follows it is parsed.  A line with no verbatim part is `weighted_segments` as is.
+    """
+    prefix, rest = adapter.split_verbatim(line)
+    if prefix is None:
+        return weighted_segments(line, emphasis_name)
+
+    out = [(prefix, 1.0)]
+    if rest.strip():
+        out.extend(weighted_segments(rest, emphasis_name))
+
+    return out
+
+
 def scan(p: "StableDiffusionProcessing", config: WeightConfig, adapter: ModelAdapter) -> tuple[bool, bool, bool]:
     """`(any weight at all, any weight this config claims, any weight that needs a logit bias)`.
 
@@ -52,18 +70,18 @@ def scan(p: "StableDiffusionProcessing", config: WeightConfig, adapter: ModelAda
     backend has to be forced to the one that accepts an additive mask, which is a cost
     worth avoiding when nothing in the prompt asks for amplification.
 
-    A line the adapter encodes verbatim (a MOSS-Image layout) is data, not a prompt with
-    weights in it, and never activates anything.
+    The part of a line the adapter encodes verbatim (a MOSS-Image layout) is data, not a
+    prompt with weights in it, and never activates anything; a layout alone is inert.
     """
     emphasis_name = current_emphasis_name()
     weighted = handled = biased = False
 
     for field in PROMPT_FIELDS:
         for line in getattr(p, field, None) or ():
-            if not isinstance(line, str) or adapter.is_verbatim(line):
+            if not isinstance(line, str):
                 continue
 
-            for _, weight in weighted_segments(line, emphasis_name):
+            for _, weight in segments(adapter, line, emphasis_name):
                 weighted = weighted or weight != 1.0
                 handled = handled or config.handles(weight)
                 biased = biased or config.logit_bias(weight) != 0.0

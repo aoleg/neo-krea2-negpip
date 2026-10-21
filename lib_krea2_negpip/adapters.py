@@ -109,9 +109,18 @@ class ModelAdapter:
     def before_encode(self, prompt):
         """The bookkeeping the engine's `get_learned_conditioning` does before encoding."""
 
+    def split_verbatim(self, line: str) -> tuple[str | None, str]:
+        """`(verbatim prefix, the rest)`: the part of the line the model reads as data.
+
+        The prefix never goes through the prompt parser and carries neutral rows; the rest
+        is parsed like any other prompt text.  `(None, line)` when the whole line is prompt.
+        """
+        return None, line
+
     def is_verbatim(self, line: str) -> bool:
-        """Whether this line must never go through the prompt parser."""
-        return False
+        """Whether the whole line must never go through the prompt parser."""
+        prefix, rest = self.split_verbatim(line)
+        return prefix is not None and not rest.strip()
 
     def plain_ids(self, line: str) -> list[int] | None:
         """The engine's own token ids for a line it would encode unchanged, or `None` to
@@ -200,9 +209,9 @@ class ModelAdapter:
 def detect(model: Any) -> ModelAdapter | None:
     """The adapter for the loaded diffusion engine, or `None` for a model nobody handles."""
     from lib_krea2_negpip.krea2 import Krea2Adapter
-    from lib_krea2_negpip.moss import MossAdapter
+    from lib_krea2_negpip.moss import MossExtensionAdapter, MossNativeAdapter
 
-    for adapter in (Krea2Adapter, MossAdapter):
+    for adapter in (Krea2Adapter, MossNativeAdapter, MossExtensionAdapter):
         if adapter.matches(model):
             return adapter(model)
 

@@ -50,7 +50,7 @@ The console confirms it took effect, with the number of words affected:
 NegPiP Enable (Positive: 3)
 ```
 
-Nothing happens unless a prompt contains a weight, so it is safe to leave switched on all the time. On current Forge Neo you want it on for any weighted prompt on either model: since 2026-09-30 Forge reads `(word:1.2)` on Krea 2 as literal text, brackets included, the MOSS-Image extension has always done the same, and this extension is what turns it back into a weight.
+Nothing happens unless a prompt contains a weight, so it is safe to leave switched on all the time. On current Forge Neo you want it on for any weighted prompt on either model: since 2026-09-30 Forge reads `(word:1.2)` on Krea 2 as literal text, brackets included, MOSS-Image has always done the same, and this extension is what turns it back into a weight.
 
 ## What it looks like
 
@@ -203,17 +203,17 @@ All settings are saved into the image's generation parameters and paste back fro
 
 ## MOSS-Image
 
-MOSS-Image reaches Forge Neo through the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension, which hands the prompt to its Qwen3.5 text encoder verbatim — `(blue theme:2.0)` arrives as text, brackets and number included, and the room comes out red with *Blue Theme* written on the wall. With this extension on, the same panel and the same settings apply, and the levers do what they do on Krea 2: a negative weight flips the word's contribution inside each of the 42 blocks, weights above `1` raise how much the image attends to the word. A few things are different, all of them following the model:
+MOSS-Image is in Forge Neo itself since 2026-10-21; before that it came through the [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension, which is still supported and still takes over while it is installed. Either way the prompt reaches the Qwen3.5 text encoder verbatim — `(blue theme:2.0)` arrives as text, brackets and number included, and the room comes out red with *Blue Theme* written on the wall. With this extension on, the same panel and the same settings apply, and the levers do what they do on Krea 2: a negative weight flips the word's contribution inside each of the 42 blocks, weights above `1` raise how much the image attends to the word. A few things are different, all of them following the model:
 
 - **The whole chat template is in the conditioning.** The MOSS-Image DiT reads every token of the templated prompt, template included, so there is nothing to strip and the weights cover exactly the words you wrote. The text sits at the *end* of the model's joint sequence rather than the start; the extension puts the rows there.
-- **One pass, always.** The MOSS-Image extension never encoded a weighted prompt segment by segment, so **Encode the prompt in one pass** has nothing to switch off there. The option is recorded as you set it and the console says once that it was ignored.
+- **One pass, always.** MOSS-Image never encoded a weighted prompt segment by segment, so **Encode the prompt in one pass** has nothing to switch off there. The option is recorded as you set it and the console says once that it was ignored.
 - **Ordinary emphasis is ComfyUI's.** A weight this extension does not claim — `(word:0.8)` with **Handle de-emphasis too** off, or `(word:1.5)` with both emphasis levers off — is applied the way ComfyUI applies prompt weights to this model: the word's encoding is moved towards an empty encoding by the weight. Settings → *Emphasis* still decides whether weights are parsed at all (`None`, `Ignore`), but *Original* and *No norm* both mean that lerp here.
-- **Layout prompts pass through untouched.** A layout — the whole prompt as one JSON object, as written by hand or by [Regional Boxes](https://github.com/eduardoabreu81/sd-regional-boxes-neo), with or without the braces sd-dynamic-prompts strips — is data, not a prompt with weights in it. Its `[top, left, bottom, right]` boxes would otherwise be read as de-emphasis. Such a prompt is encoded exactly as the MOSS-Image extension encodes it, and a layout alone never switches the extension on.
-- **`BREAK` is a plain word**, as it is for the MOSS-Image extension; with weights in the prompt it stays one.
-- **The negative-pass block skip keeps working.** The MOSS-Image extension's *Blocks skipped in the negative-prompt pass* setting is honoured under the hooks.
-- **It only hooks what it recognises.** The MOSS-Image extension is third-party and at 0.1.x. If its engine or DiT is not shaped the way this extension expects — the wrong number of blocks, a missing projection, a renamed attention — NegPiP stands down and the console says exactly what it was looking for: `NegPiP stands down on MOSS-Image: ...`. Forge and the MOSS-Image extension keep working.
+- **Layout prompts pass through untouched.** A layout — the prompt as one JSON object, written by hand, by Forge's **JSON Builder** tab or by [Regional Boxes](https://github.com/eduardoabreu81/sd-regional-boxes-neo), with or without the braces sd-dynamic-prompts strips — is data, not a prompt with weights in it. Its `[top, left, bottom, right]` boxes would otherwise be read as de-emphasis. The layout is encoded exactly as the engine encodes it, and a layout alone never switches the extension on. Text *after* the layout is an ordinary prompt: the JSON Builder's **Extra** field lands there, and a weight in it works. A weight inside a caption does not; the builder writes it as plain text anyway.
+- **`BREAK` is a plain word**, as it is for MOSS-Image; with weights in the prompt it stays one.
+- **Skip Layer Guidance keeps working.** Forge's *[Moss-Image] Enable Skip Layer Guidance* setting (block 22 left out of the negative pass), and the older extension's *Blocks skipped in the negative-prompt pass*, are honoured under the hooks.
+- **It only hooks what it recognises.** If the engine or DiT is not shaped the way this extension expects — the wrong number of blocks, a missing projection, a renamed attention — NegPiP stands down and the console says exactly what it was looking for: `NegPiP stands down on MOSS-Image: ...`. Forge keeps working.
 
-Suggested first tests, both on the SFT model (`moss_image_sft_int8_convrot`), Euler, the MOSS schedule, 20 steps, CFG 3, one seed, after [flyfront's](https://github.com/flyfront/sd-forge-negpip) MOSS-Image examples:
+Suggested first tests, both on the SFT model (`moss_image_sft_int8_convrot`), the **moss** preset (Euler, Simple, 50 steps, CFG 3; 20 steps is enough to see), one seed, after [flyfront's](https://github.com/flyfront/sd-forge-negpip) MOSS-Image examples:
 
 ```text
 a cute cat sitting on a sofa in a living room, (a red apple:-1.0) on the table
@@ -233,7 +233,7 @@ against `red theme, blue theme` — the room should turn towards blue, where wit
 - **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if **Handle emphasis in attention** has been switched off.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
 - **Is the checkpoint Krea 2 or MOSS-Image?** It deliberately does nothing on other models.
-- **On MOSS-Image, is the prompt a layout?** A JSON layout is passed through as data, weights and all; see [MOSS-Image](#moss-image). And look for a `NegPiP stands down on MOSS-Image:` line, which names the part of the MOSS-Image extension that did not look the way this one expects.
+- **On MOSS-Image, is the prompt a layout?** A JSON layout is passed through as data, weights and all; only text after it, such as the JSON Builder's **Extra** field, is read for weights. See [MOSS-Image](#moss-image). And look for a `NegPiP stands down on MOSS-Image:` line, which names the part of the engine or DiT that did not look the way this extension expects.
 
 ## If a negative weight softens the whole image
 

@@ -59,7 +59,7 @@ from modules.shared import opts
 
 from lib_krea2_negpip import NEGPIP_BIAS_KEY, NEGPIP_MASK_KEY, WeightConfig
 from lib_krea2_negpip.adapters import ModelAdapter
-from lib_krea2_negpip.prompts import weighted_segments
+from lib_krea2_negpip.prompts import segments
 
 ORIGINAL_ATTR = "_krea2_negpip_original_conditioning"
 
@@ -339,13 +339,10 @@ def _tokenize_line(adapter: ModelAdapter, line: str, config: WeightConfig, empha
     """One prompt line -> the token stream plus the three rows indexed by it."""
     global _warned_single_pass, _warned_joined, _warned_split
 
-    #   a line the model reads as data (a MOSS-Image layout) never meets the parser, whose
-    #   square brackets would turn a bounding box into de-emphasis; it is the engine's own
-    #   stream with neutral rows
-    if adapter.is_verbatim(line):
-        return _neutral(adapter.plain_ids(line))
-
-    parsed = weighted_segments(line, emphasis_name)
+    #   the part of a line the model reads as data (a MOSS-Image layout) never meets the
+    #   parser, whose square brackets would turn a bounding box into de-emphasis; it comes
+    #   back as one neutral segment, and a line that is all data as the engine's own stream
+    parsed = segments(adapter, line, emphasis_name)
 
     if all(weight == 1.0 for _, weight in parsed):
         #   an engine that can hand over its own ids for an unweighted line does, so the

@@ -43,7 +43,7 @@ from lib_krea2_negpip import dit as negpip_dit
 from lib_krea2_negpip import moss as negpip_moss
 from lib_krea2_negpip import text as negpip_text
 from lib_krea2_negpip.adapters import detect
-from lib_krea2_negpip.moss import MossAdapter
+from lib_krea2_negpip.moss import MossAdapter, MossExtensionAdapter
 from lib_krea2_negpip.prompts import scan
 
 #   the tiny DiT runs on the CPU, where Forge's flash/sage pick fails and falls back with
@@ -123,11 +123,11 @@ class MossImageEngine:
 
 model = MossImageEngine()
 adapter = detect(model)
-check("detect: MossImageEngine -> MossAdapter", isinstance(adapter, MossAdapter))
+check("detect: MossImageEngine -> MossExtensionAdapter", isinstance(adapter, MossExtensionAdapter))
 check("detect: by flag alone", isinstance(detect(type("Other", (), {"is_moss_image": True, "text_engine_moss": engine})()), MossAdapter))
 check("engine: no problem with the real text engine", adapter.engine_problem() is None)
 check("engine: template and max length from the engine's module", adapter.template == text_engine.TEMPLATE and adapter.max_length == text_engine.MAX_LENGTH and adapter.max_length == 4096)
-check("engine: a missing text engine is named", "text_engine_moss" in (MossAdapter(types.SimpleNamespace(is_moss_image=True)).engine_problem() or ""))
+check("engine: a missing text engine is named", "text_engine_moss" in (MossExtensionAdapter(types.SimpleNamespace(is_moss_image=True)).engine_problem() or ""))
 
 
 def negpip(lines, config):
