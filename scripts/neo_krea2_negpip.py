@@ -67,8 +67,8 @@ def recorded(name: str, absent=None):
     and `absent` for a NegPiP image that did not record this setting: the infotext only
     records a setting that is on or off its default, and Forge leaves a field alone when
     its key is missing, so a pasted image would otherwise keep whatever the UI shows,
-    which for "Handle emphasis in attention" (default changed to on) is the opposite of
-    what an older image was made with.  A NegPiP image with the key missing means the
+    which for the two emphasis levers (defaults changed in 2026-10, each way) can be the
+    opposite of what an older image was made with.  A NegPiP image with the key missing means the
     setting was at the value it implies; an image with no NegPiP entries leaves the panel
     alone.
     """
@@ -139,10 +139,14 @@ class NegPiP(scripts.Script):
                 info="claim weights from 0 up to 1 as well, instead of leaving them to the ordinary emphasis pass; needed for (word:0) to delete a word outright",
             )
 
+            #   off by default since 2026-10-24: the bias needs an attention backend that takes
+            #   an additive mask, so while a prompt has a weight above 1 every attention in the
+            #   model runs on plain PyTorch SDPA instead of sage/flash, which measured about
+            #   1.4x slower sampling; the value lever below does the job on any backend
             handle_emphasis = gr.Checkbox(
-                True,
+                False,
                 label="Handle emphasis in attention",
-                info="make weights above 1 raise how much the image attends to the word, which survives the text-stage norms — scaling the embedding does not, so without this or the value lever a weight above 1 is close to inert on these models",
+                info="make weights above 1 raise how much the image attends to the word, which survives the text-stage norms; stronger-scaling than the value lever, but it forces plain SDPA attention for the whole model while such a weight is present, about 1.4x slower",
             )
 
             emphasis_gain = gr.Slider(
@@ -154,10 +158,12 @@ class NegPiP(scripts.Script):
                 info="attention weight is multiplied by exp(gain x (weight - 1)), so this compounds quickly over blocks",
             )
 
+            #   on by default since 2026-10-24, taking over from the attention lever: no speed
+            #   cost on any attention backend
             handle_value_emphasis = gr.Checkbox(
-                False,
+                True,
                 label="Amplify emphasis in values",
-                info="make weights above 1 scale what the word contributes, the same lever a negative weight uses, continued upwards: (word:2.0) contributes twice; linear inside attention, but the image's response flattens quickly; works on every attention backend; Value strength applies",
+                info="make weights above 1 scale what the word contributes, the same lever a negative weight uses, continued upwards: (word:2.0) contributes twice; linear inside attention, but the image's response flattens quickly; no speed cost on any attention backend; Value strength applies",
             )
 
             single_pass = gr.Checkbox(

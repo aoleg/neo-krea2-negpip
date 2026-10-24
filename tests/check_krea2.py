@@ -235,7 +235,7 @@ with gr.Blocks():
     components = script.ui(False)
 names = ["enable", "value_strength", "mean_reference", "deemphasis", "emphasis", "gain", "value_emphasis", "single_pass", "refiners", "block_start", "block_end", "block_stride"]
 by_name = dict(zip(names, components))
-check("default: attention on, gain 1.0", by_name["emphasis"].value is True and by_name["gain"].value == 1.0)
+check("default: value emphasis on, attention off, gain 1.0", by_name["value_emphasis"].value is True and by_name["emphasis"].value is False and by_name["gain"].value == 1.0)
 check("default: block range covers 42", by_name["block_end"].value == 41 and by_name["block_end"].maximum == 41)
 
 fields = {id(c): key for c, key in script.infotext_fields}

@@ -118,11 +118,11 @@ With the default settings, the weight you type is the strength of the subtractio
 | `(word:-0.5)` | A gentle push away. Good when `-1.0` overcorrects into something else. |
 | `(word:0)` † | The word is simply deleted from the image, without pushing away from it. Useful for a word the sentence needs in order to read naturally, but which you do not want rendered. |
 | `(word:1.0)` | Normal. No effect. |
-| `(word:2.0)` ‡ | The image attends to the word more. At the default gain `1.0` its share of attention grows by e^(weight - 1): ×1.6 at `1.5`, ×2.7 at `2.0`, ×7.4 at `3.0`. |
+| `(word:2.0)` ‡ | The word contributes twice as much to everything that attends to it, the negative scale continued upwards: `1.5` is one and a half times, `3.0` three times. |
 
 † Weights from `0` up to `1` — including `(word:0)` itself — are only handled once **Handle de-emphasis too** is switched on. Left off, they get ordinary de-emphasis, which the extension applies the way Forge did before 2026-09-30.
 
-‡ Weights above `1` are handled by **Handle emphasis in attention**, on by default. Switched off (with **Amplify emphasis in values** off too), they get ordinary emphasis, which Krea 2 normalises away almost completely — see [the ladders above](#only-the-attention-lever-keeps-scaling).
+‡ Weights above `1` are handled by **Amplify emphasis in values** (on by default) or by **Handle emphasis in attention**, which instead multiplies the word's share of attention by e^(gain × (weight - 1)) and scales further, but is off by default since 2026-10-24 because it forces plain SDPA attention for the whole model, about 1.4x slower. With both off they get ordinary emphasis, which Krea 2 normalises away almost completely — see [the ladders above](#only-the-attention-lever-keeps-scaling).
 
 Start at `-1.0`. If the thing is still there, go further negative; if the image starts looking distorted or fixated on the opposite, come back up.
 
@@ -160,7 +160,7 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 **What you'll see:** emphasis that actually works. The usual kind runs into the same normalisation problem as de-emphasis above, which is why `(word:1.4)` on Krea 2 often looks much like `(word:1.0)`. Handled here, the emphasised word visibly takes over more of the image.
 
-**On by default** since ordinary emphasis turned out to be close to inert on Krea 2. It costs a little speed while a prompt has a weight above `1`, because the attention has to run on the plain SDPA path to take the bias. Switch it off to reproduce images made before the default changed; images whose generation parameters carry NegPiP entries but no `Krea2 NegPiP emphasis` line paste back with it off.
+**Off by default since 2026-10-24.** The bias needs an attention backend that takes an additive mask, so while a prompt has a weight above `1` every attention in the model runs on plain PyTorch SDPA instead of sage or flash, which measured about 1.4x slower sampling. It was on by default before that; switch it on when the value lever's flatter response is not enough, and the console says when it is in force. Images paste back with whatever they recorded: a NegPiP image with no `emphasis` line was made with it off.
 
 ### Emphasis gain
 
@@ -174,7 +174,7 @@ Prefer editing individual weights once you know which word needs it; this is the
 
 **What you'll see:** emphasis in the same currency as suppression, and much flatter than the attention lever: the factor is linear inside attention, but the image's response levels off quickly — see [the ladders above](#only-the-attention-lever-keeps-scaling). It costs nothing in speed on any attention backend. Switching it on next to the attention lever adds to it (84% blue-dominant against 71% for attention alone at gain `2.0` in [the sheet above](#the-two-emphasis-levers)).
 
-**Off by default.** Turn it on with the attention lever off if you need emphasis without the speed cost of the plain SDPA path.
+**On by default since 2026-10-24**, taking over from the attention lever as the default way weights above `1` are applied, because it costs nothing in speed on any attention backend. Images made before carry no `value emphasis` line and paste back with it off.
 
 ### Encode the prompt in one pass
 
@@ -230,7 +230,7 @@ against `red theme, blue theme` — the room should turn towards blue, where wit
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
-- **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if **Handle emphasis in attention** has been switched off.
+- **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if both **Amplify emphasis in values** and **Handle emphasis in attention** have been switched off.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
 - **Is the checkpoint Krea 2 or MOSS-Image?** It deliberately does nothing on other models.
 - **On MOSS-Image, is the prompt a layout?** A JSON layout is passed through as data, weights and all; only text after it, such as the JSON Builder's **Extra** field, is read for weights. See [MOSS-Image](#moss-image). And look for a `NegPiP stands down on MOSS-Image:` line, which names the part of the engine or DiT that did not look the way this extension expects.
