@@ -41,6 +41,7 @@ Where the text sits, which modules those are, and how a mask reaches the attenti
 the adapter's business (`adapters.py`); this module owns the levers and the hooking.
 """
 
+import inspect
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any
@@ -65,6 +66,46 @@ REFERENCE_ATTR = "_krea2_negpip_mean_reference"
 ORIGINAL_FORWARD = "_krea2_negpip_original_forward"
 ORIGINAL_VALUE = "_krea2_negpip_original_value_forward"
 ORIGINAL_ATTENTION = "_krea2_negpip_original_attention_function"
+
+
+class CallSignature:
+    """Where each parameter of `original` sits, so a wrapper can read or replace one by name.
+
+    A wrapper that spells the wrapped method's parameters out breaks the day the framework
+    adds one: Forge's `c6c2b43d` gave the MOSS-Image block three more positional
+    parameters for reference images, and a wrapper written as `(x, mod, pe,
+    transformer_options={})` raised on the fourth positional.  This reads the signature
+    once and lets the wrapper take `(*args, **kwargs)`, pick the parameter it needs out of
+    wherever the caller put it, substitute its replacement in that same place, and pass
+    everything else through untouched.  Looking a parameter up by name also means a
+    parameter interposed before it cannot silently take its value, which the earlier
+    keyword-past-the-positionals rule guarded against.
+    """
+
+    def __init__(self, original: Any):
+        try:
+            params = [p for p in inspect.signature(original).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        except (TypeError, ValueError):
+            params = []
+
+        self.index = {p.name: i for i, p in enumerate(params)}
+        self.defaults = {p.name: p.default for p in params if p.default is not p.empty}
+
+    def get(self, args: tuple, kwargs: dict, name: str, default: Any = None) -> Any:
+        """The value the call passes for `name`, or its default."""
+        i = self.index.get(name)
+        if i is not None and i < len(args):
+            return args[i]
+        if name in kwargs:
+            return kwargs[name]
+        return self.defaults.get(name, default)
+
+    def replace(self, args: tuple, kwargs: dict, name: str, value: Any) -> tuple[tuple, dict]:
+        """`(args, kwargs)` with `name` set to `value`, in the place the caller passed it."""
+        i = self.index.get(name)
+        if i is not None and i < len(args):
+            return (*args[:i], value, *args[i + 1 :]), kwargs
+        return args, {**kwargs, name: value}
 
 
 def selected_blocks(count: int, start: int, end: int, stride: int) -> list[int]:
@@ -169,7 +210,7 @@ def _apply_value_flip(v: torch.Tensor, mask: torch.Tensor, reference: float = 0.
     return v
 
 
-def attention_bias(batch: int, keys: int, bias: torch.Tensor, text_first: bool, like: torch.Tensor) -> torch.Tensor | None:
+def attention_bias(batch: int, keys: int, bias: torch.Tensor, text_first: bool, like: torch.Tensor, within: int | None = None) -> torch.Tensor | None:
     """`(B, 1, keys)` additive logit bias over a module's whole key axis, or `None`.
 
     The row only covers the text tokens; the main blocks attend over the joint sequence,
@@ -177,11 +218,17 @@ def attention_bias(batch: int, keys: int, bias: torch.Tensor, text_first: bool, 
     `(B, 1, keys)` is what `attention_pytorch` unsqueezes to `(B, 1, 1, keys)` — one bias
     per batch row, which is what keeps cond and uncond from reading each other's row.
     `like` only lends its device and dtype.
+
+    `within` is the length of the joint sequence the text sits in when the key axis is
+    longer than it: MOSS-Image Edit appends the reference images' keys and values after
+    the sequence's own inside attention, and the text is the tail of the *queries*, not of
+    the keys.  Left out, the sequence is the whole key axis.
     """
     if not torch.is_tensor(bias) or bias.ndim != 3:
         return None
 
-    length = min(int(bias.shape[1]), keys)
+    total = keys if within is None else min(int(within), keys)
+    length = min(int(bias.shape[1]), total)
     if length <= 0:
         return None
 
@@ -190,7 +237,7 @@ def attention_bias(batch: int, keys: int, bias: torch.Tensor, text_first: bool, 
         return None
 
     out = like.new_zeros((batch, 1, keys))
-    out[:, 0, _text_span(length, keys, text_first)] = row[:, :, 0]
+    out[:, 0, _text_span(length, total, text_first)] = row[:, :, 0]
     return out
 
 
@@ -431,4 +478,4 @@ def unpatch_dit(adapter: ModelAdapter, dit: Any):
         _hook_attention(adapter, site, remove=True)
 
 
-__all__ = ["ROLE_BLOCK", "ROLE_REFINER", "active", "attention_bias", "patch_dit", "selected_blocks", "unpatch_dit"]
+__all__ = ["ROLE_BLOCK", "ROLE_REFINER", "CallSignature", "active", "attention_bias", "patch_dit", "selected_blocks", "unpatch_dit"]

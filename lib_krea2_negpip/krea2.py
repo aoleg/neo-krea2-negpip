@@ -52,7 +52,7 @@ from modules.shared import opts
 
 from lib_krea2_negpip import ROLE_BLOCK, ROLE_REFINER
 from lib_krea2_negpip.adapters import AttentionSite, ModelAdapter
-from lib_krea2_negpip.dit import ORIGINAL_ATTENTION, active, attention_bias
+from lib_krea2_negpip.dit import ORIGINAL_ATTENTION, CallSignature, active, attention_bias
 
 #   `type(shared.sd_model).__name__` for `backend/diffusion_engine/krea.py`
 KREA2_ENGINE = "Krea2"
@@ -268,31 +268,35 @@ class Krea2Adapter(ModelAdapter):
         Krea 2 never passes an attention mask — `SingleStreamDiT.forward` hands `None` to
         every block and to `txtfusion` — so the bias rides the `mask` argument that is
         already threaded through `Attention.forward` to `attention_function`, and no
-        attention math needs copying.
+        attention math needs copying.  `mask` and `transformer_options` are found by name
+        in whatever shape the call arrives (`CallSignature`), so a parameter Forge adds to
+        the block neither breaks the wrapper nor takes another one's value — the ComfyUI
+        node hit exactly the latter when Krea 2 Edit added `ref_latents` to its signature.
         """
         text_first = self.text_first
+        sig = CallSignature(original)
 
         @wraps(original)
-        def negpip_forward(x, freqs=None, mask=None, transformer_options={}):
+        def negpip_forward(*args, **kwargs):
             global _warned_mask
 
+            transformer_options = sig.get(args, kwargs, "transformer_options", {})
+
             with active(site, transformer_options) as bias:
-                if bias is not None and torch.is_tensor(x):
-                    if mask is None:
-                        mask = attention_bias(int(x.shape[0]), int(x.shape[1]), bias, text_first, like=x)
-                    elif not _warned_mask:
+                if bias is not None:
+                    x = sig.get(args, kwargs, "x")
+                    mask = sig.get(args, kwargs, "mask")
+
+                    if mask is None and torch.is_tensor(x):
+                        args, kwargs = sig.replace(args, kwargs, "mask", attention_bias(int(x.shape[0]), int(x.shape[1]), bias, text_first, like=x))
+                    elif mask is not None and not _warned_mask:
                         #   Krea 2 has never passed one; if that changes, adding the bias
                         #   to somebody else's mask is not obviously the right merge, so
                         #   say so
                         _warned_mask = True
                         logger.warning("NegPiP: attention already carries a mask, skipping the emphasis bias")
 
-                #   by keyword past the required positional: a parameter interposed
-                #   before `transformer_options` would otherwise silently take our options
-                #   dict and leave the real one at its default, which is a working forward
-                #   pass that quietly does nothing.  The ComfyUI node hit exactly this when
-                #   Krea 2 Edit added `ref_latents` to the signature there.
-                return original(x, freqs=freqs, mask=mask, transformer_options=transformer_options)
+                return original(*args, **kwargs)
 
         return negpip_forward
 

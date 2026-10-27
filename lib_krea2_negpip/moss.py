@@ -56,12 +56,14 @@ from typing import Any, Callable
 
 import torch
 
+from backend.args import dynamic_args
 from backend.attention import attention_pytorch
 from backend.text_processing import emphasis
+from modules.shared import opts
 
 from lib_krea2_negpip import ROLE_BLOCK, ROLE_REFINER
 from lib_krea2_negpip.adapters import AttentionSite, ModelAdapter
-from lib_krea2_negpip.dit import ORIGINAL_ATTENTION, active, attention_bias
+from lib_krea2_negpip.dit import ORIGINAL_ATTENTION, CallSignature, active, attention_bias
 
 #   `type(shared.sd_model).__name__` for the extension's `forge_moss/native/engine.py`
 MOSS_EXTENSION_ENGINE = "MossImageEngine"
@@ -267,6 +269,30 @@ class MossAdapter(ModelAdapter):
 
         return [AttentionSite(module=block, value=block.qkv, value_slice=_values(dim), role=ROLE_REFINER) for block in blocks if getattr(block, "qkv", None) is not None]
 
+    def wrap_attention(self, site: AttentionSite, original: Callable) -> Callable:
+        """`Block.forward` / `TextBlock.forward` with the bias put where the attention swap reads it.
+
+        Neither takes a mask, so the bias travels in a copy of `transformer_options` under
+        `LIVE_BIAS_KEY`; `force_pytorch_attention`'s wrapper on the attention callable picks
+        it up there, inside this block's own attention call and nowhere else.
+        `transformer_options` is found by name in whatever shape the call arrives
+        (`CallSignature`) and everything else passes through untouched: Forge's `c6c2b43d`
+        gave the native block `ref`, `ref_kv` and `kv_out` after it, positionally, and the
+        extension's block and refiner have different parameter lists again.
+        """
+        sig = CallSignature(original)
+
+        @wraps(original)
+        def negpip_forward(*args, **kwargs):
+            options = sig.get(args, kwargs, "transformer_options", {})
+
+            with active(site, options) as bias:
+                if bias is not None:
+                    args, kwargs = sig.replace(args, kwargs, "transformer_options", _options_with(options, bias))
+                return original(*args, **kwargs)
+
+        return negpip_forward
+
 
 # ================================================================================ #
 
@@ -344,30 +370,6 @@ class MossExtensionAdapter(MossAdapter):
             return "the transformer module has no kernels.attention"
         return None
 
-    def wrap_attention(self, site: AttentionSite, original: Callable) -> Callable:
-        """`Block.forward` / `TextBlock.forward` with the bias put where the attention swap reads it.
-
-        Neither takes a mask, so the bias travels in a copy of `transformer_options` under
-        `LIVE_BIAS_KEY`; `force_pytorch_attention`'s wrapper on `kernels.attention` picks it
-        up there, inside this block's own attention call and nowhere else.
-        """
-        if site.role == ROLE_REFINER:
-
-            @wraps(original)
-            def negpip_forward(x, rope, dtype, transformer_options=None):
-                with active(site, transformer_options) as bias:
-                    #   keyword past the required positionals, as everywhere in this extension
-                    return original(x, rope, dtype, transformer_options=_options_with(transformer_options, bias))
-
-        else:
-
-            @wraps(original)
-            def negpip_forward(x, rope, mod, dtype, transformer_options=None):
-                with active(site, transformer_options) as bias:
-                    return original(x, rope, mod, dtype, transformer_options=_options_with(transformer_options, bias))
-
-        return negpip_forward
-
     def force_pytorch_attention(self, dit: Any, enable: bool):
         """Swap the extension's `kernels.attention` for one that takes the bias as a mask.
 
@@ -403,7 +405,7 @@ class MossExtensionAdapter(MossAdapter):
             mask = None
             if bias is not None and torch.is_tensor(q) and q.ndim == 4:
                 #   q, k, v are (B, H, S, D) here; the keys are the whole joint sequence
-                mask = attention_bias(int(q.shape[0]), int(k.shape[2]), bias, text_first, like=q)
+                mask = attention_bias(int(q.shape[0]), int(k.shape[2]), bias, text_first, like=q, within=int(q.shape[2]))
 
             if mask is None:
                 return original(q, k, v, transformer_options=transformer_options, **kwargs)
@@ -475,20 +477,70 @@ class MossNativeAdapter(MossAdapter):
         """`escape_important` then `unescape_important`, as `tokenize_with_weights` applies them."""
         return text.replace("\\)", ")").replace("\\(", "(")
 
-    def _templated(self, line: str) -> str:
-        """The text `Qwen359BEngine.__call__` hands the tokenizer for one line."""
-        text = line.strip() or " "
-        if not text.startswith(IM_START):
-            text = self.template.format(text)
-        return text
-
     def plain_ids(self, line: str) -> list[int] | None:
-        """The engine's own token ids, through the very call `__call__` makes."""
-        chunks = self.engine.tokenizer.tokenize_with_weights(self._templated(line), disable_weights=True)
+        """The engine's own token ids, through the very call `__call__` makes.
+
+        Since `c6c2b43d` the engine's `_tokenize_with_weights` templates every line (and
+        splices image placeholders in, none here); before it, `__call__` templated inline
+        and let a line that already started with `<|im_start|>` through as it was.
+        """
+        text = line.strip() or " "
+        engine = self.engine
+
+        tokenize = getattr(engine, "_tokenize_with_weights", None)
+        if callable(tokenize):
+            chunks = tokenize(text, [])
+        else:
+            if not text.startswith(IM_START):
+                text = self.template.format(text)
+            chunks = engine.tokenizer.tokenize_with_weights(text, disable_weights=True)
+
         return [token for token, _ in chunks[0]] if chunks else []
 
     def plain_encode(self, line: str) -> torch.Tensor:
         return self.engine([line])[0]
+
+    def _referencing(self) -> bool:
+        """Whether the engine would take its reference-image branch for a positive prompt."""
+        methods = getattr(_module_of(self.model), "REFERENCE_METHODS", None)
+        mode = getattr(opts, "moss_do_reference", None)
+        if methods is not None:
+            return mode in methods
+        return mode not in (None, "Disable")
+
+    def hand_back(self, prompt) -> str | None:
+        """Whether `MOSSImage.get_learned_conditioning` would take its reference-image branch.
+
+        MOSS-Image Edit (`c6c2b43d`) encodes the positive prompt alongside reference
+        images — with vision placeholders in the stream for one method — and sets up the
+        reference latents and their cached K/V as a side effect of that encode.  The whole
+        call is handed back rather than half-applied, as on Krea 2; the negative prompt
+        keeps its rows.  Read-only: the original consumes `ini_latent` and clears the
+        reference state itself.
+        """
+        if getattr(prompt, "is_negative_prompt", False):
+            return None
+        if not self._referencing():
+            return None
+
+        if bool(getattr(self.model, "ref_latents", None)) or getattr(self.model, "ini_latent", None) is not None:
+            return "NegPiP does not apply to the MOSS-Image reference/Edit path; the positive prompt's weights are ignored there"
+
+        return None
+
+    def before_encode(self, prompt):
+        if getattr(prompt, "is_negative_prompt", False):
+            return
+
+        #   the bookkeeping `MOSSImage.get_learned_conditioning` does before a plain encode,
+        #   and which the text hook replaces: the img2img latent is consumed and the
+        #   reference state dropped, so a stale one cannot put the DiT into edit mode
+        if hasattr(self.model, "ini_latent"):
+            self.model.ini_latent = None
+        dynamic_args.ref_latents.clear()
+        for name in ("moss_reference_method", "moss_ref_kv"):
+            if hasattr(dynamic_args, name):
+                setattr(dynamic_args, name, None)
 
     def attention_problem(self, dit: Any) -> str | None:
         module = _module_of(dit)
@@ -498,31 +550,15 @@ class MossNativeAdapter(MossAdapter):
             return "the DiT's module has no attention_function to swap"
         return None
 
-    def wrap_attention(self, site: AttentionSite, original: Callable) -> Callable:
-        """`Block.forward` / `TextBlock.forward` with the bias put where the attention swap reads it."""
-        if site.role == ROLE_REFINER:
-
-            @wraps(original)
-            def negpip_forward(x, pe, transformer_options={}):
-                with active(site, transformer_options) as bias:
-                    return original(x, pe, transformer_options=_options_with(transformer_options, bias))
-
-        else:
-
-            @wraps(original)
-            def negpip_forward(x, mod, pe, transformer_options={}):
-                with active(site, transformer_options) as bias:
-                    return original(x, mod, pe, transformer_options=_options_with(transformer_options, bias))
-
-        return negpip_forward
-
     def force_pytorch_attention(self, dit: Any, enable: bool):
         """Point the DiT module's `attention_function` at the backend that takes an additive mask.
 
         `attention()` calls it with the heads still flat, so the swap hands `attention_pytorch`
         the same `(B, S, H*D)` tensors and lets it split them; the keys are the whole joint
-        sequence in the blocks and the text alone in the refiners.  A call that carries no
-        bias goes to the original untouched.
+        sequence in the blocks and the text alone in the refiners.  On the Edit path
+        (`c6c2b43d`) the reference images' keys and values are appended after the
+        sequence's own, so the bias is confined to the first `q.shape[1]` keys, where the
+        text still is.  A call that carries no bias goes to the original untouched.
         """
         module = _module_of(dit)
         if module is None or not hasattr(module, "attention_function"):
@@ -548,7 +584,7 @@ class MossNativeAdapter(MossAdapter):
 
             mask = None
             if bias is not None and torch.is_tensor(k) and k.ndim == 3 and not args and not kwargs.get("skip_reshape", False):
-                mask = attention_bias(int(q.shape[0]), int(k.shape[1]), bias, text_first, like=q)
+                mask = attention_bias(int(q.shape[0]), int(k.shape[1]), bias, text_first, like=q, within=int(q.shape[1]))
 
             if mask is None:
                 return original(q, k, v, heads, *args, transformer_options=transformer_options, **kwargs)

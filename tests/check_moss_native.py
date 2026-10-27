@@ -156,8 +156,9 @@ check("empty prompt == engine's single space", torch.equal(negpip([""], one_pass
 
 markup = "<|im_start|>user\nhello there<|im_end|>\n<|im_start|>assistant\n<think>\n"
 check("chat markup: verbatim", adapter.is_verbatim(markup) and adapter.split_verbatim(markup) == (markup, ""))
-#   the engine strips the line before tokenising, so the trailing newline is not a token
-check("chat markup: no template added, == engine(line)", torch.equal(negpip([markup], one_pass)["crossattn"][0], own(markup)) and adapter.plain_ids(markup) == list(tokenizer(markup.strip())["input_ids"]))
+#   be6fa5d4 let such a line through untemplated, c6c2b43d templates it like any other; either
+#   way the ids come from the engine's own call, which the byte-equal conditioning proves
+check("chat markup: verbatim, == engine(line)", torch.equal(negpip([markup], one_pass)["crossattn"][0], own(markup)))
 
 # 2. layouts: the whole line, and the JSON Builder's output with its Extra line
 layout = json.dumps({"summary": {"meta": ["poster"], "canvas": [1024, 1024], "caption": "a vase (blue) and a teapot"}, "items": [{"label": "vase", "caption": "a blue vase", "bbox": [-400, -500, 100, -100]}, {"label": "teapot", "caption": "a red teapot", "bbox": [-400, 100, 100, 500]}], "bbox_coord_space": "abs_centralized", "bbox_format": "yxyx"})
@@ -220,6 +221,36 @@ out = negpip(["a cat, (red:-1.0) hat BREAK a dog"], one_pass)
 check("BREAK keeps its spaces", torch.equal(out["crossattn"][0], own("a cat, red hat BREAK a dog")))
 split = negpip([weighted], WeightConfig(single_pass=False))
 check("single pass off: MOSS-Image is encoded in one pass regardless", torch.equal(split["crossattn"][0], cond) and torch.equal(split[NEGPIP_MASK_KEY][0], mask))
+
+# 5b. the reference/Edit path (c6c2b43d): the positive prompt is handed back, the state kept clean
+#   a registered option lives in opts.data, an unregistered one (older Forge) on the instance;
+#   set it the way the UI does and put it back the same way
+registered = "moss_do_reference" in getattr(opts, "data_labels", {})
+previous = getattr(opts, "moss_do_reference", None)
+model.ref_latents = [torch.zeros(1, 8, 2, 2)]
+model.ini_latent = None
+opts.moss_do_reference = "Moss-Image-Edit"
+check("edit: referencing is read from the setting", adapter._referencing() and adapter.hand_back(Prompt([weighted])) is not None)
+negative = Prompt([weighted])
+negative.is_negative_prompt = True
+check("edit: the negative prompt is not handed back", adapter.hand_back(negative) is None)
+handed = negpip([weighted], one_pass)
+check("edit: the positive prompt goes to the engine whole (no rows)", isinstance(handed, list) and torch.equal(handed[0], own(weighted)))
+opts.moss_do_reference = "Disable"
+check("edit: Disable never hands back", adapter.hand_back(Prompt([weighted])) is None)
+if registered:
+    opts.moss_do_reference = previous
+else:
+    delattr(opts, "moss_do_reference")
+model.ref_latents = []
+check("edit: no references, no hand-back", adapter.hand_back(Prompt([weighted])) is None)
+
+from backend.args import dynamic_args  # noqa: E402
+
+model.ini_latent = torch.zeros(1)
+dynamic_args.ref_latents.append(torch.zeros(1))
+negpip([weighted], one_pass)
+check("plain encode: the img2img latent is consumed and the reference list dropped", model.ini_latent is None and not dynamic_args.ref_latents)
 
 # 6. several lines and the inverse
 out = negpip([plain, weighted, plain], one_pass)
@@ -311,6 +342,73 @@ with torch.no_grad():
     plain_skip = dit(x, sigma, context, transformer_options=dict(slg))
 check("SLG: hooked == unpatched with the block skipped, and the skip is real", torch.equal(hooked_skip, plain_skip) and not torch.allclose(plain_skip, plain_out))
 check("SLG: the flip still acts in the blocks that run", not torch.allclose(hooked_skip_flip, plain_skip))
+
+# 9b. the block wrapper takes whatever the block takes: c6c2b43d adds ref, ref_kv and kv_out positionally
+import inspect  # noqa: E402
+
+block_params = list(inspect.signature(moss_image.Block.forward).parameters)
+negpip_dit.patch_dit(adapter, dit, **options)
+layer = dit.layers[0]
+tokens = torch.randn(batch, imglen + txt, TINY["dim"], generator=generator)
+with torch.no_grad():
+    mod_vec = dit.shared_block_modulation(dit.time_embedding(moss_image.timestep_embedding(sigma, 256))).unflatten(-1, (6, -1)).unsqueeze(2).unbind(1)
+    pe = dit.rope(height, width, txt, tokens.device)
+    hooked_pos = layer(tokens, mod_vec, pe, {})
+    hooked_kw = layer(tokens, mod_vec, pe, transformer_options={})
+check("wrapper: positional and keyword transformer_options agree", torch.equal(hooked_pos, hooked_kw))
+if "ref_kv" in block_params:
+    with torch.no_grad():
+        extra = layer(tokens, mod_vec, pe, {}, None, None)
+    check("wrapper: the Edit path's extra positionals pass through", torch.equal(extra, hooked_pos))
+negpip_dit.unpatch_dit(adapter, dit)
+
+if hasattr(dit, "preprocess_refs"):
+    #   a reference image through the isolated method: its K/V are appended after the
+    #   sequence's own inside attention, the sequence itself stays [image, text]
+    ref = torch.randn(1, TINY["latent_channels"], 2, 3, generator=generator)
+    reflen = 2 * 3
+
+    def with_reference(fn):
+        dynamic_args.ref_latents[:] = [ref]
+        dynamic_args.moss_reference_method = "index_timestep_zero_text_start"
+        dynamic_args.moss_ref_kv = None
+        try:
+            return fn()
+        finally:
+            dynamic_args.ref_latents.clear()
+            dynamic_args.moss_reference_method = None
+            dynamic_args.moss_ref_kv = None
+
+    with torch.no_grad():
+        plain_ref = with_reference(lambda: dit(x, sigma, context, transformer_options={}))
+    check("edit: the reference changes the plain output", not torch.allclose(plain_ref, plain_out))
+    negpip_dit.patch_dit(adapter, dit, **options)
+    with torch.no_grad():
+        same_ref = with_reference(lambda: dit(x, sigma, context, transformer_options={}, **{NEGPIP_MASK_KEY: neutral_row}))
+        flip_ref = with_reference(lambda: dit(x, sigma, context, transformer_options={}, **{NEGPIP_MASK_KEY: mask_row}))
+    check("edit: neutral rows == unpatched output with the reference", torch.equal(same_ref, plain_ref))
+    check("edit: the flip still acts with the reference", not torch.allclose(flip_ref, plain_ref))
+    negpip_dit.unpatch_dit(adapter, dit)
+
+    captured_ref = []
+
+    def spy_ref(q, k, v, heads, mask=None, **kwargs):
+        captured_ref.append((int(q.shape[1]), int(k.shape[1]), mask.clone()))
+        return negpip_moss.attention_pytorch.__wrapped__(q, k, v, heads, mask=mask, **kwargs) if hasattr(negpip_moss.attention_pytorch, "__wrapped__") else attention.attention_pytorch(q, k, v, heads, mask=mask, **kwargs)
+
+    bias_ref = torch.zeros(batch, txt, 1)
+    bias_ref[:, flip_at, 0] = 2.0
+    negpip_dit.patch_dit(adapter, dit, **dict(options, block_start=0, block_end=0, patch_refiners=False, force_pytorch_attention=True))
+    with torch.no_grad(), mock.patch.object(negpip_moss, "attention_pytorch", spy_ref):
+        with_reference(lambda: dit(x, sigma, context, transformer_options={}, **{NEGPIP_MASK_KEY: neutral_row, NEGPIP_BIAS_KEY: bias_ref}))
+    negpip_dit.unpatch_dit(adapter, dit)
+    joint = [(q, k, m) for q, k, m in captured_ref if q == imglen + txt]
+    expected_ref = torch.zeros(batch, 1, imglen + txt + reflen)
+    expected_ref[:, 0, imglen + flip_at] = 2.0
+    check("edit: the keys are the sequence plus the reference", len(joint) == 1 and joint[0][1] == imglen + txt + reflen)
+    check("edit: the bias sits on the text inside the sequence, zero on the reference keys", len(joint) == 1 and torch.equal(joint[0][2], expected_ref))
+else:
+    check("edit: this Forge has no reference path for MOSS-Image (before c6c2b43d); nothing to check", True)
 
 # 10. the logit bias: attention_function swapped for attention_pytorch with the bias at the trailing keys
 captured = []
