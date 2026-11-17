@@ -1,5 +1,5 @@
 """
-NegPiP for Krea 2 and MOSS-Image — a Forge Neo extension.
+NegPiP for Krea 2, MOSS-Image and MiniMax H3 — a Forge Neo extension.
 
 Ported from blue-pen5805' ComfyUI node (https://github.com/blue-pen5805/ComfyUI-krea2-negpip),
 which is itself a Krea 2 adaptation of hako-mikan's NegPiP.
@@ -7,10 +7,11 @@ which is itself a Krea 2 adaptation of hako-mikan's NegPiP.
 The existing Forge extension (https://github.com/Haoming02/sd-forge-negpip) covers SD1,
 SDXL and Anima.  None of those paths carry over: they either append a separately-encoded
 negative fragment to the cross-attention context and negate the tail of `to_v`, or ride a
-`c_negpip_mask` through a dedicated `SelfCrossAttention` module.  Krea 2 and MOSS-Image
-have neither — both are single-stream, so the text tokens live in the same self-attention
-sequence as the image patches, and both put non-linear text stages (Krea 2's text-fusion
-transformer, MOSS-Image's text refiners) between the conditioning and the first attention.
+`c_negpip_mask` through a dedicated `SelfCrossAttention` module.  Krea 2, MOSS-Image and
+MiniMax H3 have neither — all three are single-stream, so the text tokens live in the same
+self-attention sequence as the image patches, and all three put non-linear text stages
+(Krea 2's text-fusion transformer, MOSS-Image's and H3's text refiners) between the
+conditioning and the first attention.
 
 So the port keeps the ComfyUI node's two halves and re-plumbs the middle:
 
@@ -45,10 +46,11 @@ from lib_krea2_negpip.text import patch_text_encoder, unpatch_text_encoder
 from modules import scripts
 from modules.processing import logger
 
-#   Krea 2 is 28 single-stream blocks, MOSS-Image 42; the sliders run to the larger and
-#   `selected_blocks` clamps to the loaded model's real count, so the default means "all"
-#   on either
-DEFAULT_LAST_BLOCK = 41
+#   Krea 2 is 28 single-stream blocks, MOSS-Image 42, MiniMax H3 50; the sliders run to the
+#   largest and `selected_blocks` clamps to the loaded model's real count, so the default
+#   means "all" on each.  It was 41 before H3: an image that recorded no last block still
+#   means "all" on the two older models, since 41 and 49 both clamp to their counts
+DEFAULT_LAST_BLOCK = 49
 
 #   infotext keys were `Krea2 NegPiP ...` while Krea 2 was the only model; images made then
 #   paste back through the old name, new images are written with the model-neutral one
@@ -169,21 +171,21 @@ class NegPiP(scripts.Script):
             single_pass = gr.Checkbox(
                 True,
                 label="Encode the prompt in one pass",
-                info="on Krea 2 a weighted prompt is otherwise encoded once per weighted segment, each in its own copy of the chat template — which buries the prompt in repeated boilerplate and is the single largest cause of quality loss from a weighted prompt; this rejoins them so the weights change nothing but the attention levers; MOSS-Image is always encoded in one pass",
+                info="on Krea 2 a weighted prompt is otherwise encoded once per weighted segment, each in its own copy of the chat template — which buries the prompt in repeated boilerplate and is the single largest cause of quality loss from a weighted prompt; this rejoins them so the weights change nothing but the attention levers; MOSS-Image and MiniMax H3 are always encoded in one pass",
             )
 
             with gr.Accordion("Advanced", open=False):
                 patch_refiners = gr.Checkbox(
                     False,
                     label="Also act inside the text refiners",
-                    info="stronger, and applies before the image tokens ever see the text: Krea 2's text-fusion refiners, MOSS-Image's two text blocks",
+                    info="stronger, and applies before the image tokens ever see the text: Krea 2's text-fusion refiners, the two text blocks of MOSS-Image and MiniMax H3",
                 )
 
                 with gr.Row():
                     block_start = gr.Slider(minimum=0, maximum=DEFAULT_LAST_BLOCK, value=0, step=1, label="First block")
                     block_end = gr.Slider(minimum=0, maximum=DEFAULT_LAST_BLOCK, value=DEFAULT_LAST_BLOCK, step=1, label="Last block")
 
-                block_stride = gr.Slider(minimum=1, maximum=16, value=1, step=1, label="Block stride", info="act in every Nth block of the range; the range is clamped to the model's block count, 28 on Krea 2 and 42 on MOSS-Image")
+                block_stride = gr.Slider(minimum=1, maximum=16, value=1, step=1, label="Block stride", info="act in every Nth block of the range; the range is clamped to the model's block count, 28 on Krea 2, 42 on MOSS-Image and 50 on MiniMax H3")
 
         self.infotext_fields = [
             (enable, lambda d: recorded("value strength")(d) is not None),

@@ -35,6 +35,7 @@ from typing import Any, Callable
 
 import torch
 
+from backend import memory_management
 from backend.text_processing import emphasis
 
 
@@ -45,9 +46,9 @@ class AttentionSite:
     * `module` — the module whose `forward` is wrapped to park the rows for the duration
       of one call and to get the logit bias into the attention; it is whatever receives
       `transformer_options` closest to the attention.  Krea 2's `Attention`, MOSS-Image's
-      `Block` and `TextBlock`.
-    * `value` — the `nn.Linear` whose output carries the value vectors, wrapped to scale
-      the rows the mask names.
+      `Block` and `TextBlock`, MiniMax H3's `Attention`.
+    * `value` — the `nn.Linear` whose output carries the value vectors; a forward hook on
+      it scales the rows the mask names.
     * `value_slice` — the output columns of `value` that *are* the values, for a fused
       q/k/v projection; `None` when the whole output is the values.
     """
@@ -70,7 +71,7 @@ class ModelAdapter:
     """how the model is named in log lines"""
 
     text_first: bool = True
-    """whether the text tokens lead the joint sequence (Krea 2) or trail it (MOSS-Image)"""
+    """whether the text tokens lead the joint sequence (Krea 2, MiniMax H3) or trail it (MOSS-Image)"""
 
     split_encode: bool = True
     """whether `single_pass=False` has a meaning: Forge's old one-template-per-segment encode"""
@@ -108,6 +109,10 @@ class ModelAdapter:
 
     def before_encode(self, prompt):
         """The bookkeeping the engine's `get_learned_conditioning` does before encoding."""
+
+    def load_text_encoder(self):
+        """Put the text encoder on the GPU the way the engine's own encode would."""
+        memory_management.load_model_gpu(self.model.forge_objects.clip.patcher)
 
     def split_verbatim(self, line: str) -> tuple[str | None, str]:
         """`(verbatim prefix, the rest)`: the part of the line the model reads as data.
@@ -155,6 +160,17 @@ class ModelAdapter:
         """How many leading positions the engine cuts off the conditioning."""
         return 0
 
+    def pinned_positions(self) -> int:
+        """How many leading positions of the conditioning no row may touch.
+
+        Counted after `template_end`.  `0` everywhere but MiniMax H3 behind P-H3-Image's
+        text encoder, whose connector replaces position 0 with a learned sink.
+        """
+        return 0
+
+    pinned_reason: str = ""
+    """logged once when a weight lands on a pinned position and is dropped there"""
+
     def segment_text_span(self, segment: list) -> tuple[int, int]:
         """`[start, end)` of the prompt fragment inside one templated segment (split encode only)."""
         return 0, len(segment)
@@ -195,6 +211,14 @@ class ModelAdapter:
         """
         raise NotImplementedError
 
+    def hook_model(self, dit: Any, enable: bool):
+        """Any wrapper of the adapter's own beyond the DiT forward and the attention sites.
+
+        Called by `patch_dit` after the DiT forward is wrapped and by `unpatch_dit` with
+        `enable=False`, which must undo it completely.  Nothing by default; MiniMax H3 uses
+        it to reach the text refiner, which is called without `transformer_options`.
+        """
+
     def force_pytorch_attention(self, dit: Any, enable: bool):
         """Make the attention accept an additive mask while a bias is in play, and undo it.
 
@@ -208,10 +232,11 @@ class ModelAdapter:
 
 def detect(model: Any) -> ModelAdapter | None:
     """The adapter for the loaded diffusion engine, or `None` for a model nobody handles."""
+    from lib_krea2_negpip.h3 import H3Adapter
     from lib_krea2_negpip.krea2 import Krea2Adapter
     from lib_krea2_negpip.moss import MossExtensionAdapter, MossNativeAdapter
 
-    for adapter in (Krea2Adapter, MossNativeAdapter, MossExtensionAdapter):
+    for adapter in (Krea2Adapter, MossNativeAdapter, MossExtensionAdapter, H3Adapter):
         if adapter.matches(model):
             return adapter(model)
 

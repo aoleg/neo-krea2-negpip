@@ -25,7 +25,8 @@ Neither engine applies that emphasis itself any more: since Forge Neo `21886f41`
 to the encoder as literal text, parentheses included, and the MOSS-Image extension never
 did otherwise.  So the encode is this module's, through the adapter: `Krea2Adapter.encode`
 puts back what the engine did before that commit — the selected emphasis on the input
-embeddings — and `MossAdapter.encode` applies the ComfyUI output lerp its encoder offers.
+embeddings — and `MossAdapter.encode` and `H3Adapter.encode` apply the ComfyUI output lerp
+their encoders offer.
 Either way an unclaimed weight still means something.
 
 Both rows are built over the exact token stream the multipliers are built over, and sliced
@@ -51,7 +52,6 @@ from typing import Any
 
 import torch
 
-from backend import memory_management
 from backend.args import dynamic_args
 from backend.text_processing import emphasis
 from modules.processing import logger
@@ -399,7 +399,7 @@ def _encode_line(adapter: ModelAdapter, line: str, config: WeightConfig, weighti
     """One prompt line -> `(conditioning, value factors, logit biases, claimed tokens)`."""
     tokens, multipliers, factors, biases = _tokenize_line(adapter, line, config, weighting.name)
 
-    global _warned_expanded
+    global _warned_expanded, _warned_pinned
 
     z = adapter.encode(line, tokens, multipliers, weighting)  # token axis first, template on
 
@@ -423,6 +423,17 @@ def _encode_line(adapter: ModelAdapter, line: str, config: WeightConfig, weighti
     visible_factors = _row(factors[template_end:], seq, 1.0) if aligned else [1.0] * seq
     visible_biases = _row(biases[template_end:], seq, 0.0) if aligned else [0.0] * seq
 
+    #   a position the model overwrites after the encoder (P-H3-Image's sink) carries no
+    #   word any more; a weight there would act on the replacement, so it is dropped, and
+    #   said once, since the infotext still records the weight
+    pinned = min(adapter.pinned_positions(), seq)
+    if pinned:
+        if any(f != 1.0 or b != 0.0 for f, b in zip(visible_factors[:pinned], visible_biases[:pinned])) and not _warned_pinned:
+            _warned_pinned = True
+            logger.warning(adapter.pinned_reason)
+        visible_factors[:pinned] = [1.0] * pinned
+        visible_biases[:pinned] = [0.0] * pinned
+
     def column(values: list[float]) -> torch.Tensor:
         #   indexed 1:1 with the conditioning's leading axis, so Forge's own batching and
         #   scheduling code keeps the two together without any realignment of ours; the
@@ -436,6 +447,7 @@ def _encode_line(adapter: ModelAdapter, line: str, config: WeightConfig, weighti
 
 _warned_hand_back = False
 _warned_expanded = False
+_warned_pinned = False
 _warned_single_pass = False
 _warned_joined = False
 _warned_split = False
@@ -484,7 +496,7 @@ def patch_text_encoder(adapter: ModelAdapter, config: WeightConfig):
                 logger.warning(reason)
             return original(prompt)
 
-        memory_management.load_model_gpu(model.forge_objects.clip.patcher)
+        adapter.load_text_encoder()
         adapter.before_encode(prompt)
 
         #   neither engine reads the setting any more; it is read here, as the engines did

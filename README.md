@@ -1,6 +1,6 @@
-# NegPiP for Krea 2 and MOSS-Image
+# NegPiP for Krea 2, MOSS-Image and MiniMax H3
 
-A **Forge Neo** extension that lets you put negative prompting *inside* your prompt, for **Krea 2** and **MOSS-Image**.
+A **Forge Neo** extension that lets you put negative prompting *inside* your prompt, for **Krea 2**, **MOSS-Image** and **MiniMax H3** (MiniMax-H3-Image, P-H3-Image).
 
 Give a word a negative weight and the model subtracts it instead of emphasising it:
 
@@ -16,7 +16,7 @@ It works in either field:
 - `(aqua hair:-1.0)` in the **negative** prompt *enforces* it instead — a double negative
 
 > [!NOTE]
-> **Krea 2 and MOSS-Image only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle. MOSS-Image works on Forge Neo's own support (since 2026-10-21) and on the older [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension (0.1.x) alike; whichever loaded the model is detected. See [MOSS-Image](#moss-image) for what differs there.
+> **Krea 2, MOSS-Image and MiniMax H3 only.** For SD1, SDXL and Anima use [sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip). The two can be installed side by side; each stands down for models it does not handle. MOSS-Image works on Forge Neo's own support (since 2026-10-21) and on the older [moss-image-forge-neo](https://github.com/eduardoabreu81/moss-image-forge-neo) extension (0.1.x) alike; whichever loaded the model is detected. See [MOSS-Image](#moss-image) for what differs there. MiniMax H3 comes through the [pruna-P-H3-Image-forge-neo](https://github.com/aoleg/pruna-P-H3-Image-forge-neo) extension, with either text encoder it accepts; see [MiniMax H3](#minimax-h3).
 
 ## Install
 
@@ -40,7 +40,7 @@ The panel used to be titled *NegPiP (Krea 2)*. The title is also the key your `u
 
 ## Quick start
 
-1. Load a Krea 2 or MOSS-Image checkpoint.
+1. Load a Krea 2, MOSS-Image or MiniMax H3 checkpoint.
 2. Open the **NegPiP (Krea 2 / MOSS-Image)** panel and tick it on.
 3. Put a negative weight in either prompt field and generate.
 
@@ -195,8 +195,8 @@ If the tokenizer cannot say where each fragment landed, the extension tokenises 
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Also act inside the text refiners | off | Applies the effect one stage earlier, before the image has read the text at all: Krea 2's text-fusion refiners, MOSS-Image's two text blocks. Noticeably stronger and harder to steer — reach for it when a stubborn concept survives everything else. |
-| First block / Last block | `0` / `41` | Which part of the model is affected, out of 28 stages on Krea 2 and 42 on MOSS-Image; the range is clamped to the loaded model, so the default covers all of either. Narrowing the range weakens the effect and changes its character: as a rule of thumb the early stages shape composition and layout, the later ones texture and detail. Restricting to late blocks can remove a *look* while leaving the arrangement of the image alone. |
+| Also act inside the text refiners | off | Applies the effect one stage earlier, before the image has read the text at all: Krea 2's text-fusion refiners, the two text blocks of MOSS-Image and MiniMax H3. Noticeably stronger and harder to steer — reach for it when a stubborn concept survives everything else. |
+| First block / Last block | `0` / `49` | Which part of the model is affected, out of 28 stages on Krea 2, 42 on MOSS-Image and 50 on MiniMax H3; the range is clamped to the loaded model, so the default covers all of each. Narrowing the range weakens the effect and changes its character: as a rule of thumb the early stages shape composition and layout, the later ones texture and detail. Restricting to late blocks can remove a *look* while leaving the arrangement of the image alone. |
 | Block stride | `1` | Apply in every Nth stage instead of all of them. Another way to soften the effect while keeping it spread across the whole model. |
 
 All settings are saved into the image's generation parameters and paste back from them. They are written as `NegPiP ...` entries; images made while Krea 2 was the only model carry `Krea2 NegPiP ...` entries, which paste back the same way.
@@ -228,12 +228,39 @@ a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
 
 against `red theme, blue theme` — the room should turn towards blue, where with the extension off it stays red and may letter the weight on the wall. The console should print `NegPiP Enable (Positive: 3)` for the first (three tokens: `a`, `red`, `apple`) and `NegPiP Enable (Positive: 2)` for the second.
 
+## MiniMax H3
+
+MiniMax H3 reaches Forge Neo through the [pruna-P-H3-Image-forge-neo](https://github.com/aoleg/pruna-P-H3-Image-forge-neo) extension, which runs MiniMax-H3-Image, P-H3-Image and MiniMax H3. That extension passes the prompt to the text encoder verbatim, so without this one `(blue theme:2.0)` is read as text. With this extension on, the same panel and the same settings apply, and a negative weight flips the word's contribution inside each of the 50 blocks. Both text encoders the H3 extension accepts work: the 32B Qwen3-VL, and P-H3-Image's much smaller 4B one with Pruna's text connector, which stands in for it on cards with less than 32 GB. A few things are different, all of them following the model:
+
+- **There is no chat template.** The prompt is encoded as written, with no special tokens, and the DiT reads every token. So the weights cover exactly the words you wrote. The text sits at the *start* of the model's joint sequence, as on Krea 2.
+- **With P-H3-Image's text encoder, the first token is lost.** Pruna's connector replaces the first position of every prompt with a learned "sink" vector, so the first token of the prompt never reaches the image model as itself. A weight on it cannot act. The extension keeps that position neutral and says once in the console that the weight was dropped. Put the weighted word later in the prompt: `a photo of a cat, (watermark:-1.0)` works, `(watermark:-1.0), a photo of a cat` loses at least the first token of the word.
+- **One pass, always**, as on MOSS-Image. **Encode the prompt in one pass** has nothing to switch off.
+- **Ordinary emphasis is ComfyUI's**, as on MOSS-Image: a weight this extension does not claim moves the word's encoding towards an empty encoding.
+- **Edits and Blank reference are handed back.** When the H3 panel has pictures, or Blank reference is on, both prompts are encoded after the pictures, and the H3 extension encodes them itself. Their weights are then read as text, and the console says so once. Text-to-image and standard img2img are supported.
+- **On-the-fly LoRAs on the INT8 checkpoint are covered.** The flip is applied after the LoRA's share of the values, so a LoRA cannot leak the suppressed word back in.
+- **It only hooks what it recognises**, and says what it was looking for otherwise: `NegPiP stands down on MiniMax H3: ...`.
+
+No MiniMax H3 images have been made with this extension yet; it has been verified offline against the H3 extension's own modules. Suggested first tests, MiniMax-H3-Image with its own preset, one seed:
+
+```text
+a cute cat sitting on a sofa in a living room, (a red apple:-1.0) on the table
+```
+
+against the same prompt with `a red apple on the table`, and
+
+```text
+a cute cat sitting on a sofa in a living room, red theme, (blue theme:2.0)
+```
+
+against `red theme, blue theme`. Run each once with the 32B text encoder and once with P-H3-Image's, if you have both: the console prints the same `NegPiP Enable` counts for either.
+
 ## If nothing seems to happen
 
 - **Check the console.** No `NegPiP Enable` line means it never engaged.
 - **Is the weight between `0` and `1`?** With **Handle de-emphasis too** off, `(word:0.7)` gets ordinary de-emphasis, which Krea 2 normalises away, and prints no `NegPiP Enable` line. The same goes for `(word:1.5)` if both **Amplify emphasis in values** and **Handle emphasis in attention** have been switched off.
 - **Check Settings → *Emphasis*.** If it is set to `None`, Forge treats `(word:-1.0)` as literal text and there is no weight to act on. The extension logs a warning and stands down.
-- **Is the checkpoint Krea 2 or MOSS-Image?** It deliberately does nothing on other models.
+- **Is the checkpoint Krea 2, MOSS-Image or MiniMax H3?** It deliberately does nothing on other models.
+- **On MiniMax H3, is it an edit, or is Blank reference on?** Prompts encoded after pictures are left to the H3 extension, weights read as text, with one console warning. See [MiniMax H3](#minimax-h3).
 - **On MOSS-Image, is the prompt a layout?** A JSON layout is passed through as data, weights and all; only text after it, such as the JSON Builder's **Extra** field, is read for weights. See [MOSS-Image](#moss-image). And look for a `NegPiP stands down on MOSS-Image:` line, which names the part of the engine or DiT that did not look the way this extension expects.
 
 ## If a negative weight softens the whole image
@@ -249,7 +276,7 @@ If you are reading this because an *old* image looked better, check its generati
 
 - **Hires. fix is covered.** Weights in the hires prompt count too, and the effect applies across both passes.
 - **Re-encoding.** Switching the extension on, off, or changing any of its settings makes the next image re-encode its prompt. Repeat batches at unchanged settings are unaffected.
-- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text; MOSS-Image always did, in Forge and in the extension. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply on Krea 2, as set in Settings → *Emphasis*, and ComfyUI's weighting on MOSS-Image. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, the brackets are read as text.
+- **Ordinary weights.** Since 2026-09-30 Forge Neo ignores prompt weights on Krea 2 and gives the brackets to the model as text; MOSS-Image and MiniMax H3 always did. While the extension is on, any weight in either prompt engages it, and a weight it does not take (for example `(word:0.8)` with **Handle de-emphasis too** off) gets the emphasis Forge used to apply on Krea 2, as set in Settings → *Emphasis*, and ComfyUI's weighting on MOSS-Image and MiniMax H3. Such a batch only re-encodes the prompt; the model itself is not hooked, so the DiT settings (*Reference the prompt mean*, the refiners and the block range) do nothing there. With the extension off, the brackets are read as text.
 - **Nothing is modified in Forge itself.** Every change is undone when the extension stands down.
 
 ## How it works

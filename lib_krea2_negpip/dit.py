@@ -64,7 +64,7 @@ from lib_krea2_negpip.adapters import AttentionSite, ModelAdapter
 ACTIVE_ATTR = "_krea2_negpip_active_mask"
 REFERENCE_ATTR = "_krea2_negpip_mean_reference"
 ORIGINAL_FORWARD = "_krea2_negpip_original_forward"
-ORIGINAL_VALUE = "_krea2_negpip_original_value_forward"
+VALUE_HOOK = "_krea2_negpip_value_hook"
 ORIGINAL_ATTENTION = "_krea2_negpip_original_attention_function"
 
 
@@ -272,43 +272,48 @@ def _restore_forward(obj: Any, original: Any):
 
 
 def _hook_value(adapter: ModelAdapter, site: AttentionSite, remove: bool):
+    """A forward hook on the value linear that scales the flagged rows of its output.
+
+    A forward *hook*, not a replaced `forward`: the hook runs on whatever `forward` the
+    module has at call time, so it composes with anything else that swaps the method.  The
+    H3 extension's on-the-fly LoRA does exactly that on its INT8 layers (`LowRankForward`
+    in `forge_h3/native/lora.py`, installed per sampling run and left in place): wrapped
+    around a replaced `forward`, it added the LoRA's share of the values *after* the flip,
+    and each run stacked another wrapper that unpatching could no longer recognise.
+    """
     value = site.value
     if value is None:
         return
 
     if remove:
-        original = getattr(value, ORIGINAL_VALUE, None)
-        if original is not None:
-            if getattr(value.forward, "_negpip", False):
-                _restore_forward(value, original)
-            delattr(value, ORIGINAL_VALUE)
+        handle = getattr(value, VALUE_HOOK, None)
+        if handle is not None:
+            handle.remove()
+            delattr(value, VALUE_HOOK)
         return
 
-    if getattr(value, ORIGINAL_VALUE, None) is not None:
+    if getattr(value, VALUE_HOOK, None) is not None:
         return
 
-    original = value.forward
     module, columns, text_first = site.module, site.value_slice, adapter.text_first
 
-    @wraps(original)
-    def negpip_forward(*args, **kwargs):
-        out = original(*args, **kwargs)
+    def negpip_value(_linear, _inputs, out):
         mask = getattr(module, ACTIVE_ATTR, None)
         if mask is None or not torch.is_tensor(out):
-            return out
+            return
 
         reference = getattr(module, REFERENCE_ATTR, 0.0)
-        if columns is None:
-            return _apply_value_flip(out, mask, reference, text_first)
 
         #   a view: the values are scaled where they lie, and q and k are not touched
-        _apply_value_flip(out[..., columns], mask, reference, text_first)
-        return out
+        values = out if columns is None else out[..., columns]
+        if values.ndim == 2:
+            #   (S, C) with no batch axis — MiniMax H3 runs its DiT one sample at a time;
+            #   `unsqueeze` is a view too, so the write still lands in `out`
+            values = values.unsqueeze(0)
 
-    negpip_forward._negpip = True
+        _apply_value_flip(values, mask, reference, text_first)
 
-    setattr(value, ORIGINAL_VALUE, original)
-    value.forward = negpip_forward
+    setattr(value, VALUE_HOOK, value.register_forward_hook(negpip_value))
 
 
 def _hook_attention(adapter: ModelAdapter, site: AttentionSite, mean_reference: float = 0.0, remove: bool = False):
@@ -445,6 +450,7 @@ def patch_dit(adapter: ModelAdapter, dit: Any, *, block_start: int, block_end: i
     _hook_compile_conditions()
     adapter.force_pytorch_attention(dit, force_pytorch_attention)
     _hook_dit(dit, False)
+    adapter.hook_model(dit, True)
 
     hooked = 0
 
@@ -473,9 +479,10 @@ def unpatch_dit(adapter: ModelAdapter, dit: Any):
 
     adapter.force_pytorch_attention(dit, False)
     _hook_dit(dit, True)
+    adapter.hook_model(dit, False)
 
     for site in [*adapter.block_sites(dit), *adapter.refiner_sites(dit)]:
         _hook_attention(adapter, site, remove=True)
 
 
-__all__ = ["ROLE_BLOCK", "ROLE_REFINER", "CallSignature", "active", "attention_bias", "patch_dit", "selected_blocks", "unpatch_dit"]
+__all__ = ["ROLE_BLOCK", "ROLE_REFINER", "VALUE_HOOK", "CallSignature", "active", "attention_bias", "patch_dit", "selected_blocks", "unpatch_dit"]
